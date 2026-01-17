@@ -2,6 +2,8 @@
 pragma solidity >=0.7.0 <0.9.0;
 
 import "./base/Proxy.sol";
+import "./interfaces/IIgarriUSDC.sol";
+import "./interfaces/IIgarriVault.sol";
 
 /**
  * @title IgarriMarketFactory
@@ -10,6 +12,9 @@ import "./base/Proxy.sol";
  */
 contract IgarriMarketFactory {
     mapping (address => bool) public deployer;
+    address private owner;
+    address public igarriUSDC;
+    address public igarriVault;
 
     // Events for transparency and indexing
     event ProxyDeployed(
@@ -27,11 +32,17 @@ contract IgarriMarketFactory {
     error InvalidSingleton();
 
     constructor() {
+        owner = msg.sender;
         deployer[msg.sender] = true;
     }
 
     modifier onlyDeployer() {
         require(deployer[msg.sender], "Not the deployer");
+        _;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
         _;
     }
 
@@ -88,6 +99,9 @@ contract IgarriMarketFactory {
                 }
             }
         }
+
+        IIgarriUSDC(igarriUSDC).addAllowedMarket(address(proxy));
+        IIgarriVault(igarriVault).addAllowedMarket(address(proxy));
 
         emit ProxyDeployed(address(proxy), singleton, salt, msg.sender);
     }
@@ -164,4 +178,21 @@ contract IgarriMarketFactory {
     function addDeployer(address _deployer) external onlyDeployer {
         deployer[_deployer] = true;
     }
+
+    /**
+     * @notice Sets the Igarri USDC address
+     * @param _igarriUSDC The address of the Igarri USDC contract
+     */
+    function setIgarriUSDC(address _igarriUSDC) external onlyOwner {
+        igarriUSDC = _igarriUSDC;
+    }
+
+    /**
+     * @notice Sets the Igarri Vault address
+     * @param _igarriVault The address of the Igarri Vault contract
+     */
+    function setIgarriVault(address _igarriVault) external onlyOwner {
+        igarriVault = _igarriVault;
+    }
+
 }

@@ -76,6 +76,17 @@ contract IgarriVault is ReentrancyGuard {
     }
 
     /**
+     * @notice Transfer real USDC to a market
+     */
+    function transferToMarket(address _market, uint256 _amount) external nonReentrant onlyAllowedMarket() {
+        uint256 amountToTransfer = _amount / SCALE_FACTOR;
+
+        if (realUSDC.balanceOf(address(this)) < amountToTransfer) revert InsufficientLiquidity();
+
+        realUSDC.transfer(_market, amountToTransfer);
+    }
+
+    /**
      * @notice Adds a new allowed market
      * @param _newAllowedMarket The new allowed market address
      */

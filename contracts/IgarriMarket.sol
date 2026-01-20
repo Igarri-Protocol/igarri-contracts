@@ -3,11 +3,12 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interfaces/IIgarriUSDC.sol";
+import "./interfaces/IIgarriVault.sol";
 import "./tokens/IgarriOutcomeToken.sol";
 import "./common/Singleton.sol";
 import "./common/StorageAccessible.sol";
 
-contract IgarriMarketPhase1 is Singleton, StorageAccessible, ReentrancyGuard {
+contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
     uint256 public constant K = 100; 
     uint256 public constant INSURANCE_FEE_BPS = 50; 
     uint256 public migrationThreshold;
@@ -15,6 +16,7 @@ contract IgarriMarketPhase1 is Singleton, StorageAccessible, ReentrancyGuard {
     IIgarriUSDC public igUSDC;
     IgarriOutcomeToken public yesToken;
     IgarriOutcomeToken public noToken;
+    IIgarriVault public vault;
     
     uint256 public totalCapital; 
     uint256 public currentSupply; 
@@ -31,16 +33,19 @@ contract IgarriMarketPhase1 is Singleton, StorageAccessible, ReentrancyGuard {
     /**
      * @notice Proxy initialization
      * @param _igUSDC Address of the IgarriUSDC contract
+     * @param _vault Address of the IgarriVault contract
      * @param _marketName Name used to prefix the YES/NO tokens
      */
-    function initialize(address _igUSDC, string memory _marketName, uint256 _migrationThreshold) external {
+    function initialize(address _igUSDC, address _vault, string memory _marketName, uint256 _migrationThreshold) external {
         require(address(igUSDC) == address(0), "Already initialized");
 
         require(_igUSDC != address(0), "Invalid igUSDC address");
+        require(_vault != address(0), "Invalid vault address");
         require(bytes(_marketName).length > 0, "Invalid market name");
-        require(migrationThreshold > 0, "Invalid migration threshold");
+        require(_migrationThreshold > 0, "Invalid migration threshold");
 
         igUSDC = IIgarriUSDC(_igUSDC);
+        vault = IIgarriVault(_vault);
         
         yesToken = new IgarriOutcomeToken(
             string(abi.encodePacked(_marketName, " YES")), 
@@ -85,6 +90,7 @@ contract IgarriMarketPhase1 is Singleton, StorageAccessible, ReentrancyGuard {
 
         // Execute the transfer (Allowed via Factory whitelist)
         igUSDC.transferFrom(msg.sender, address(this), totalCost);
+        vault.transferToMarket(address(this), totalCost);
 
         currentSupply += _shareAmount;
         totalCapital += rawCost;

@@ -25,4 +25,5 @@ interface IIgarriVault {
     function addAllowedMarket(address _newAllowedMarket) external;
     function setIgarriUSDC(address _igUSDC) external;
     function setIgarriMarketFactory(address _igarriMarketFactory) external;
+    function transferToMarket(address _market, uint256 _amount) external;
 }

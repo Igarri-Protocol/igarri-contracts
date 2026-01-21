@@ -82,28 +82,39 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
     /**
      * @notice Execute bulk purchase of YES or NO shares
      */
-    function buyShares(bool _isYes, uint256 _shareAmount) external nonReentrant {
+   function buyShares(bool _isYes, uint256 _shareAmount) external nonReentrant {
         require(!migrated, "Market migrated");
         
+        uint256 finalShareAmount = _shareAmount;
         (uint256 rawCost, uint256 fee) = getQuote(_shareAmount);
-        uint256 totalCost = rawCost + fee;
 
-        // Execute the transfer (Allowed via Factory whitelist)
-        igUSDC.transferFrom(msg.sender, address(this), totalCost);
-        vault.transferToMarket(address(this), totalCost);
-
-        currentSupply += _shareAmount;
-        totalCapital += rawCost;
-
-        if (_isYes) {
-            yesToken.mint(msg.sender, _shareAmount);
-        } else {
-            noToken.mint(msg.sender, _shareAmount);
+        if (totalCapital + rawCost > migrationThreshold) {
+            uint256 neededCapital = migrationThreshold - totalCapital;
+            uint256 sStart = currentSupply;
+            
+            // Recalculate sEnd
+            uint256 sEnd = _sqrt((2 * 1e6 * neededCapital / K) + (sStart**2));
+            finalShareAmount = sEnd - sStart;
+            (rawCost, fee) = getQuote(finalShareAmount);
+            
+            // FORCE SNAP: If we are very close to the threshold after calculation, 
+            // we override rawCost to ensure the if() statement triggers.
+            if (totalCapital + rawCost >= migrationThreshold - 1e12) { // 1e12 is a small dust buffer
+                rawCost = migrationThreshold - totalCapital;
+            }
         }
 
-        emit BulkBuy(msg.sender, _isYes, totalCost, _shareAmount);
+        uint256 totalCost = rawCost + fee;
+        igUSDC.transferFrom(msg.sender, address(this), totalCost);
 
-        // TRIGGER: If we are at or ABOVE threshold, we migrate immediately
+        currentSupply += finalShareAmount;
+        totalCapital += rawCost;
+
+        if (_isYes) yesToken.mint(msg.sender, finalShareAmount);
+        else noToken.mint(msg.sender, finalShareAmount);
+
+        emit BulkBuy(msg.sender, _isYes, totalCost, finalShareAmount);
+
         if (totalCapital >= migrationThreshold) {
             _migrate();
         }
@@ -111,7 +122,20 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
 
     function _migrate() internal {
         migrated = true;
+
+        vault.transferToMarket(address(this), totalCapital);
     
         emit Migrated(totalCapital, currentSupply);
+    }
+
+    function _sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y > 3) {
+            z = y;
+            uint256 x = y / 2 + 1;
+            while (x < z) {
+                z = x;
+                x = (y / x + x) / 2;
+            }
+        } else if (y != 0) z = 1;
     }
 }

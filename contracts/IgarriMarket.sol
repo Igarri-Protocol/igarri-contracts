@@ -7,6 +7,7 @@ import "./interfaces/IIgarriVault.sol";
 import "./tokens/IgarriOutcomeToken.sol";
 import "./common/Singleton.sol";
 import "./common/StorageAccessible.sol";
+import "./interfaces/IAavePool.sol";
 
 contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
     uint256 public constant K = 100; 
@@ -17,6 +18,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
     IgarriOutcomeToken public yesToken;
     IgarriOutcomeToken public noToken;
     IIgarriVault public vault;
+    IAavePool public aavePool;
     
     uint256 public totalCapital; 
     uint256 public currentSupply; 
@@ -35,8 +37,9 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
      * @param _igUSDC Address of the IgarriUSDC contract
      * @param _vault Address of the IgarriVault contract
      * @param _marketName Name used to prefix the YES/NO tokens
+     * @param _aavePool Address of the AavePool contract
      */
-    function initialize(address _igUSDC, address _vault, string memory _marketName, uint256 _migrationThreshold) external {
+    function initialize(address _igUSDC, address _vault, string memory _marketName, uint256 _migrationThreshold, address _aavePool) external {
         require(address(igUSDC) == address(0), "Already initialized");
 
         require(_igUSDC != address(0), "Invalid igUSDC address");
@@ -46,6 +49,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
 
         igUSDC = IIgarriUSDC(_igUSDC);
         vault = IIgarriVault(_vault);
+        aavePool = IAavePool(_aavePool);
         
         yesToken = new IgarriOutcomeToken(
             string(abi.encodePacked(_marketName, " YES")), 
@@ -123,7 +127,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
     function _migrate() internal {
         migrated = true;
 
-        vault.transferToMarket(address(this), totalCapital);
+        vault.transferToMarket(address(this), migrationThreshold);
     
         emit Migrated(totalCapital, currentSupply);
     }

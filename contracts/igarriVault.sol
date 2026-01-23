@@ -4,16 +4,22 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interfaces/IIgarriUSDC.sol";
+import "./interfaces/IAavePool.sol";
 
 contract IgarriVault is ReentrancyGuard {
     IERC20 public immutable realUSDC;
     IIgarriUSDC public igUSDC;
     mapping(address => bool) public allowedMarkets;
     address public igarriMarketFactory;
-    
+    IAavePool public aavePool;
+
+    IERC20 public yieldToken;
+    uint256 public totalRealUSDCInVault;
+
     address public owner;
 
     uint256 public constant SCALE_FACTOR = 10**12;
+
 
     event Deposited(address indexed user, uint256 realAmount, uint256 virtualAmount);
     event Redeemed(address indexed user, uint256 virtualAmount, uint256 realAmount);
@@ -22,8 +28,13 @@ contract IgarriVault is ReentrancyGuard {
     error Unauthorized();
     error InsufficientLiquidity();
 
-    constructor(address _realUSDC) {
+    constructor(address _realUSDC, address _aavePool, address _yieldToken) {
         realUSDC = IERC20(_realUSDC);
+        aavePool = IAavePool(_aavePool);
+        yieldToken = IERC20(_yieldToken);
+
+        realUSDC.approve(address(aavePool), type(uint256).max);
+
         owner = msg.sender;
     }
 
@@ -56,6 +67,10 @@ contract IgarriVault is ReentrancyGuard {
         uint256 amountToMint = _amount * SCALE_FACTOR;
         igUSDC.mint(msg.sender, amountToMint);
 
+        aavePool.supply(address(realUSDC), _amount, address(this), 0);
+
+        totalRealUSDCInVault += _amount;
+
         emit Deposited(msg.sender, _amount, amountToMint);
     }
 
@@ -67,10 +82,9 @@ contract IgarriVault is ReentrancyGuard {
 
         uint256 amountToReturn = _amount / SCALE_FACTOR;
         
-        if (realUSDC.balanceOf(address(this)) < amountToReturn) revert InsufficientLiquidity();
+        aavePool.withdraw(address(realUSDC), amountToReturn, msg.sender);
 
-        bool success = realUSDC.transfer(msg.sender, amountToReturn);
-        if (!success) revert TransferFailed();
+        totalRealUSDCInVault -= amountToReturn;
 
         emit Redeemed(msg.sender, _amount, amountToReturn);
     }
@@ -81,9 +95,9 @@ contract IgarriVault is ReentrancyGuard {
     function transferToMarket(address _market, uint256 _amount) external nonReentrant onlyAllowedMarket() {
         uint256 amountToTransfer = _amount / SCALE_FACTOR;
 
-        if (realUSDC.balanceOf(address(this)) < amountToTransfer) revert InsufficientLiquidity();
+        aavePool.withdraw(address(realUSDC), amountToTransfer, _market);
 
-        realUSDC.transfer(_market, amountToTransfer);
+        totalRealUSDCInVault -= amountToTransfer;
     }
 
     /**
@@ -106,5 +120,37 @@ contract IgarriVault is ReentrancyGuard {
      */
     function setIgarriMarketFactory(address _igarriMarketFactory) external onlyOwner {
         igarriMarketFactory = _igarriMarketFactory;
+    }
+
+    /**
+     * @notice Sets the Aave Pool address
+     */
+    function setAavePool(address _aavePool) external onlyOwner {
+        aavePool = IAavePool(_aavePool);
+
+        realUSDC.approve(_aavePool, type(uint256).max);
+    }
+
+    function setYieldToken(address _yieldToken) external onlyOwner {
+        yieldToken = IERC20(_yieldToken);
+    }
+
+    /**
+     * @notice Withdraws yields from the Aave Pool
+     */
+    function withdrawYields(address _to) external onlyOwner {
+        uint256 actualBalance = IERC20(yieldToken).balanceOf(address(this));
+
+       if (actualBalance > totalRealUSDCInVault) {
+           uint256 amountToWithdraw = actualBalance - totalRealUSDCInVault;
+           aavePool.withdraw(address(realUSDC), amountToWithdraw, _to);
+       }
+    }
+
+    /**
+     * @notice Transfers ownership of the contract
+     */
+    function transferOwnership(address _newOwner) external onlyOwner {
+        owner = _newOwner;
     }
 }

@@ -15,119 +15,95 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
     IERC20 public immutable realUSDC;   
     IIgarriVault public vault;           
     IAavePool public aavePool;          
-    IERC20 public aToken;                
+    IERC20 public aToken;               
 
-    address public market;
+    mapping(address => bool) public allowedMarkets; 
+
+    address public marketFactory;
     uint256 public totalBorrowed; // Tracks 6-decimal RealUSDC value
 
-    // CONSTANT FOR CONVERSION
     uint256 public constant SCALE_FACTOR = 10**12; 
     uint256 public constant MAX_UTILIZATION_RATE = 90;
 
     event Staked(address indexed user, uint256 igUsdcAmount, uint256 lpShares);
     event Unstaked(address indexed user, uint256 igUsdcAmount, uint256 lpShares);
-    event LoanFunded(uint256 amount);
-    event LoanRepaid(uint256 principalRepaid, uint256 interestPaid);
+    event LoanFunded(address indexed market, uint256 amount);
+    event LoanRepaid(address indexed market, uint256 principalRepaid, uint256 interestPaid);
 
     constructor(
         address _igUSDC, 
         address _realUSDC, 
         address _vault,
         address _aavePool,
-        address _aToken
+        address _aToken,
+        address _marketFactory
     ) ERC20("Igarri LP Token", "igLP") Ownable(msg.sender) {
         igUSDC = IERC20(_igUSDC);
         realUSDC = IERC20(_realUSDC);
         vault = IIgarriVault(_vault);
         aavePool = IAavePool(_aavePool);
         aToken = IERC20(_aToken);
-
+        marketFactory = _marketFactory;
         realUSDC.approve(_aavePool, type(uint256).max);
     }
 
-    modifier onlyMarket() {
-        require(msg.sender == market, "Only Market");
-        _;
+    modifier onlyMarketFactory() { require(msg.sender == marketFactory, "Only Market Factory"); _; }
+    modifier onlyAllowedMarket() { require(allowedMarkets[msg.sender], "Only Allowed Markets"); _; }
+
+    function addAllowedMarket(address _market) external onlyMarketFactory {
+        allowedMarkets[_market] = true;
     }
 
-    function setMarket(address _market) external onlyOwner {
-        market = _market;
-    }
-
-    /**
-     * @notice Total Assets in Underlying Terms (6 Decimals)
-     */
     function totalAssets() public view returns (uint256) {
         return aToken.balanceOf(address(this)) + totalBorrowed;
     }
 
-    /**
-     * @notice Stake igUSDC (18 dec) -> Mint igLP (18 dec) -> Supply RealUSDC (6 dec)
-     */
     function stake(uint256 _amount) external nonReentrant {
         require(_amount > 0, "Zero amount");
-
-        uint256 assets = totalAssets(); // 6 Decimals
-        uint256 supply = totalSupply(); // 18 Decimals
+        uint256 assets = totalAssets(); 
+        uint256 supply = totalSupply(); 
         uint256 shares;
 
-        if (supply == 0) {
-            shares = _amount;
-        } else {
-            // MATH FIX: We must scale assets up to 18 decimals to match supply/amount
-            // shares = (amount * supply) / (assets * SCALE)
-            shares = (_amount * supply) / (assets * SCALE_FACTOR);
-        }
+        if (supply == 0) shares = _amount;
+        else shares = (_amount * supply) / (assets * SCALE_FACTOR);
 
-        // 1. Pull igUSDC (18 Decimals)
         igUSDC.safeTransferFrom(msg.sender, address(this), _amount);
-        
-        // 2. Move Real Funds (Vault handles the 18->6 logic internally or we trigger it)
-        // Note: Vault.moveFunds expects igUSDC amount and calculates 6 decimal amount itself
         vault.moveFundsToLendingPool(_amount);
 
-        // 3. Supply to Aave (MUST USE 6 DECIMALS)
-        uint256 realAmount = _amount / SCALE_FACTOR; // <--- FIX IS HERE
+        uint256 realAmount = _amount / SCALE_FACTOR; 
         aavePool.supply(address(realUSDC), realAmount, address(this), 0);
 
         _mint(msg.sender, shares);
         emit Staked(msg.sender, _amount, shares);
     }
 
-    /**
-     * @notice Unstake igLP (18 dec) -> Withdraw RealUSDC (6 dec) -> Return igUSDC (18 dec)
-     */
     function unstake(uint256 _shares) external nonReentrant {
         require(_shares > 0, "Zero shares");
         require(balanceOf(msg.sender) >= _shares, "Insufficient balance");
 
-        uint256 assets = totalAssets(); // 6 Decimals
-        uint256 supply = totalSupply(); // 18 Decimals
-        
-        // Calculate the 6-decimal value of these shares
-        // Amount = (Shares * Assets) / Supply
-        // Result is in 6 decimals because 'Assets' is 6 decimals
+        uint256 assets = totalAssets();
+        uint256 supply = totalSupply(); 
         uint256 amount = (_shares * assets) / supply;
 
+        // Liquidity Check: We need enough liquid cash in Aave
         require(aToken.balanceOf(address(this)) >= amount, "Utilization high");
 
         _burn(msg.sender, _shares);
-
-        // Withdraw 6 Decimals from Aave
         aavePool.withdraw(address(realUSDC), amount, address(this));
 
-        // Return 6 Decimals to Vault
         realUSDC.approve(address(vault), amount);
         vault.receiveFundsFromLendingPool(amount);
 
-        // Return 18 Decimals to User
-        uint256 igUsdcAmount = amount * SCALE_FACTOR; // <--- FIX IS HERE
+        uint256 igUsdcAmount = amount * SCALE_FACTOR; 
         igUSDC.safeTransfer(msg.sender, igUsdcAmount);
 
         emit Unstaked(msg.sender, igUsdcAmount, _shares);
     }
 
-    function fundLoan(uint256 _amount) external onlyMarket {
+    /**
+     * @notice UPDATED: Physically transfers funds to the market
+     */
+    function fundLoan(uint256 _amount) external onlyAllowedMarket {
         uint256 liquidity = aToken.balanceOf(address(this));
         uint256 assets = totalAssets();
         
@@ -135,30 +111,37 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
         require(liquidity >= _amount, "Insufficient liquidity");
         
         totalBorrowed += _amount;
-        emit LoanFunded(_amount);
+
+        // --- THE FIX: Move Real USDC to Market ---
+        aavePool.withdraw(address(realUSDC), _amount, address(this));
+        realUSDC.safeTransfer(msg.sender, _amount);
+        // -----------------------------------------
+
+        emit LoanFunded(msg.sender, _amount);
     }
 
-    function repayLoan(uint256 _amount, uint256 _interest) external onlyMarket nonReentrant {
+    /**
+     * @notice UPDATED: Receives funds and deposits back to Aave
+     */
+    function repayLoan(uint256 _amount, uint256 _interest) external onlyAllowedMarket nonReentrant {
         if (_amount >= totalBorrowed) totalBorrowed = 0;
         else totalBorrowed -= _amount;
 
         uint256 totalRepayment = _amount + _interest;
 
+        // Market must have approved us to pull this amount
         realUSDC.safeTransferFrom(msg.sender, address(this), totalRepayment);
+        
+        // Put it back to work immediately
         aavePool.supply(address(realUSDC), totalRepayment, address(this), 0);
         
-        emit LoanRepaid(_amount, _interest);
+        emit LoanRepaid(msg.sender, _amount, _interest);
     }
 
     function previewUserBalance(address _user) external view returns (uint256) {
-        uint256 userShares = balanceOf(_user);
         uint256 supply = totalSupply();
-        
         if (supply == 0) return 0;
-
-        // Formula: (UserShares * TotalAssets) / TotalSupply
-        // Result is 6 decimals. Scale up to 18 for display.
         uint256 assets18 = totalAssets() * SCALE_FACTOR;
-        return (userShares * assets18) / supply;
+        return (balanceOf(_user) * assets18) / supply;
     }
 }

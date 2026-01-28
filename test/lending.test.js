@@ -54,6 +54,7 @@ describe("Igarri Lending Vault (Isolated)", function () {
       await vault.getAddress(),
       await aavePool.getAddress(),
       await yieldToken.getAddress(),
+      owner.address,
     );
     await lendingVault.waitForDeployment();
 

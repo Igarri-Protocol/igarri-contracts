@@ -4,6 +4,7 @@ pragma solidity >=0.7.0 <0.9.0;
 import "./base/Proxy.sol";
 import "./interfaces/IIgarriUSDC.sol";
 import "./interfaces/IIgarriVault.sol";
+import "./interfaces/IIgarriLendingVault.sol";
 
 /**
  * @title IgarriMarketFactory
@@ -15,6 +16,7 @@ contract IgarriMarketFactory {
     address private owner;
     address public igarriUSDC;
     address public igarriVault;
+    address public igarriLendingVault;
 
     // Events for transparency and indexing
     event ProxyDeployed(
@@ -102,6 +104,7 @@ contract IgarriMarketFactory {
 
         IIgarriUSDC(igarriUSDC).addAllowedMarket(address(proxy));
         IIgarriVault(igarriVault).addAllowedMarket(address(proxy));
+        IIgarriLendingVault(igarriLendingVault).addAllowedMarket(address(proxy));
 
         emit ProxyDeployed(address(proxy), singleton, salt, msg.sender);
     }
@@ -193,6 +196,14 @@ contract IgarriMarketFactory {
      */
     function setIgarriVault(address _igarriVault) external onlyOwner {
         igarriVault = _igarriVault;
+    }
+
+    /**
+     * @notice Sets the Igarri Lending Vault address
+     * @param _igarriLendingVault The address of the Igarri Lending Vault contract
+     */
+    function setIgarriLendingVault(address _igarriLendingVault) external onlyOwner {
+        igarriLendingVault = _igarriLendingVault;
     }
 
 }

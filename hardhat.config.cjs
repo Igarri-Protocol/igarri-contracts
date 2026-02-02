@@ -17,7 +17,7 @@ module.exports = {
           },
         },
       },
-      evmVersion: "paris",
+      evmVersion: "cancun",
       viaIR: true,
     },
   },

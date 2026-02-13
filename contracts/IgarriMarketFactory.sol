@@ -5,6 +5,7 @@ import "./base/Proxy.sol";
 import "./interfaces/IIgarriUSDC.sol";
 import "./interfaces/IIgarriVault.sol";
 import "./interfaces/IIgarriLendingVault.sol";
+import "./interfaces/IIgarriInsuranceFund.sol";
 
 /**
  * @title IgarriMarketFactory
@@ -17,6 +18,7 @@ contract IgarriMarketFactory {
     address public igarriUSDC;
     address public igarriVault;
     address public igarriLendingVault;
+    address public igarriInsuranceFund;
 
     // Events for transparency and indexing
     event ProxyDeployed(
@@ -105,6 +107,7 @@ contract IgarriMarketFactory {
         IIgarriUSDC(igarriUSDC).addAllowedMarket(address(proxy));
         IIgarriVault(igarriVault).addAllowedMarket(address(proxy));
         IIgarriLendingVault(igarriLendingVault).addAllowedMarket(address(proxy));
+        IIgarriInsuranceFund(igarriInsuranceFund).setAllowedMarket(address(proxy), true);
 
         emit ProxyDeployed(address(proxy), singleton, salt, msg.sender);
     }
@@ -204,6 +207,14 @@ contract IgarriMarketFactory {
      */
     function setIgarriLendingVault(address _igarriLendingVault) external onlyOwner {
         igarriLendingVault = _igarriLendingVault;
+    }
+
+    /**
+     * @notice Sets the Igarri Insurance Fund address
+     * @param _igarriInsuranceFund The address of the Igarri Insurance Fund contract
+     */
+    function setIgarriInsuranceFund(address _igarriInsuranceFund) external onlyOwner {
+        igarriInsuranceFund = _igarriInsuranceFund;
     }
 
 }

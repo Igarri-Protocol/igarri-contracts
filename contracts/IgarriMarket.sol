@@ -11,11 +11,13 @@ import "@openzeppelin/contracts/utils/Nonces.sol";
 
 import "./interfaces/IIgarriUSDC.sol";
 import "./interfaces/IIgarriVault.sol";
+import "./interfaces/IIgarriLendingVault.sol";
+import "./interfaces/IAavePool.sol";
+import "./interfaces/IIgarriInsuranceFund.sol";
+
 import "./tokens/IgarriOutcomeToken.sol";
 import "./common/Singleton.sol";
 import "./common/StorageAccessible.sol";
-import "./interfaces/IAavePool.sol";
-import "./interfaces/IIgarriLendingVault.sol";
 
 contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, Nonces {
     using SafeERC20 for IERC20;
@@ -54,6 +56,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
     IgarriOutcomeToken public noToken;
     IIgarriVault public vault;
     IIgarriLendingVault public lendingVault;
+    IIgarriInsuranceFund public insuranceFund;
 
     uint256 public totalCapital;
     uint256 public currentSupply;
@@ -109,7 +112,8 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         string memory _marketName,
         uint256 _migrationThreshold,
         address _lendingVault,
-        address _serverSigner 
+        address _serverSigner,
+        address _insuranceFund
     ) external {
         require(address(igUSDC) == address(0), "Already initialized");
         igUSDC = IIgarriUSDC(_igUSDC);
@@ -122,6 +126,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         noToken = new IgarriOutcomeToken(string(abi.encodePacked(_marketName, " NO")), "NO", address(this));
         realUSDC.approve(address(vault), type(uint256).max);
         realUSDC.approve(address(lendingVault), type(uint256).max);
+        insuranceFund = IIgarriInsuranceFund(_insuranceFund);
     }
 
     function setServerSigner(address _newSigner) external {
@@ -312,12 +317,34 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
 
         uint256 usdcReturned18 = _sellTovAMM(_isYes, pos.shares);
         uint256 usdcReturned6 = usdcReturned18 / SCALE_FACTOR;
-        uint256 amountToRepay = usdcReturned6 >= pos.loanAmount ? pos.loanAmount : usdcReturned6;
-        uint256 surplus = usdcReturned6 > pos.loanAmount ? usdcReturned6 - pos.loanAmount : 0;
-        uint256 keeperReward = (surplus * 500) / BPS;
-        uint256 traderRefund = surplus - keeperReward;
+        
+        uint256 amountToRepay;
+        uint256 keeperReward;
+        uint256 traderRefund;
+
+        if (usdcReturned6 < pos.loanAmount) {
+            uint256 shortfall = pos.loanAmount - usdcReturned6;
+            insuranceFund.coverBadDebt(shortfall);
+            amountToRepay = pos.loanAmount; 
+            keeperReward = 0;
+            traderRefund = 0;
+        } else {
+            amountToRepay = pos.loanAmount;
+            uint256 surplus = usdcReturned6 - pos.loanAmount;
+            
+            uint256 insuranceFee = (surplus * 1000) / BPS;
+            if (insuranceFee > 0) {
+                realUSDC.approve(address(insuranceFund), insuranceFee);
+                insuranceFund.depositFee(insuranceFee);
+            }
+            
+            uint256 remainingSurplus = surplus - insuranceFee;
+            keeperReward = (remainingSurplus * 500) / BPS; 
+            traderRefund = remainingSurplus - keeperReward;
+        }
 
         if (amountToRepay > 0) lendingVault.repayLoan(amountToRepay, 0);
+
         if (keeperReward > 0) {
             vault.deposit(keeperReward);
             igUSDC.transfer(_keeper, keeperReward * SCALE_FACTOR);
@@ -326,6 +353,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
             vault.deposit(traderRefund);
             igUSDC.transfer(_trader, traderRefund * SCALE_FACTOR);
         }
+
         totalBorrowed -= amountToRepay;
         pos.active = false;
         emit PositionLiquidated(_trader, _isYes, _keeper, keeperReward, amountToRepay, traderRefund);

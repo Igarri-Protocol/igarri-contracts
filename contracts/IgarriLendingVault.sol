@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/IAavePool.sol";
 import "./interfaces/IIgarriVault.sol";
+import "./interfaces/IIgarriInsuranceFund.sol";
 
 contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -20,15 +21,20 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
     mapping(address => bool) public allowedMarkets; 
 
     address public marketFactory;
-    uint256 public totalBorrowed; // Tracks 6-decimal RealUSDC value
+    uint256 public totalBorrowed;
 
     uint256 public constant SCALE_FACTOR = 10**12; 
     uint256 public constant MAX_UTILIZATION_RATE = 90;
+
+    IIgarriInsuranceFund public insuranceFund;
+    uint256 public reserveFactorBps = 1000;
 
     event Staked(address indexed user, uint256 igUsdcAmount, uint256 lpShares);
     event Unstaked(address indexed user, uint256 igUsdcAmount, uint256 lpShares);
     event LoanFunded(address indexed market, uint256 amount);
     event LoanRepaid(address indexed market, uint256 principalRepaid, uint256 interestPaid);
+    event InsuranceFundUpdated(address indexed newFund);
+    event ReserveFactorUpdated(uint256 newFactor);
 
     constructor(
         address _igUSDC, 
@@ -85,7 +91,6 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
         uint256 supply = totalSupply(); 
         uint256 amount = (_shares * assets) / supply;
 
-        // Liquidity Check: We need enough liquid cash in Aave
         require(aToken.balanceOf(address(this)) >= amount, "Utilization high");
 
         _burn(msg.sender, _shares);
@@ -100,9 +105,6 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
         emit Unstaked(msg.sender, igUsdcAmount, _shares);
     }
 
-    /**
-     * @notice UPDATED: Physically transfers funds to the market
-     */
     function fundLoan(uint256 _amount) external onlyAllowedMarket {
         uint256 liquidity = aToken.balanceOf(address(this));
         uint256 assets = totalAssets();
@@ -112,28 +114,34 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
         
         totalBorrowed += _amount;
 
-        // --- THE FIX: Move Real USDC to Market ---
         aavePool.withdraw(address(realUSDC), _amount, address(this));
         realUSDC.safeTransfer(msg.sender, _amount);
-        // -----------------------------------------
 
         emit LoanFunded(msg.sender, _amount);
     }
 
-    /**
-     * @notice UPDATED: Receives funds and deposits back to Aave
-     */
     function repayLoan(uint256 _amount, uint256 _interest) external onlyAllowedMarket nonReentrant {
         if (_amount >= totalBorrowed) totalBorrowed = 0;
         else totalBorrowed -= _amount;
 
         uint256 totalRepayment = _amount + _interest;
 
-        // Market must have approved us to pull this amount
         realUSDC.safeTransferFrom(msg.sender, address(this), totalRepayment);
         
-        // Put it back to work immediately
-        aavePool.supply(address(realUSDC), totalRepayment, address(this), 0);
+        uint256 insuranceCut = 0;
+        if (_interest > 0 && address(insuranceFund) != address(0)) {
+            insuranceCut = (_interest * reserveFactorBps) / 10000;
+            if (insuranceCut > 0) {
+                realUSDC.approve(address(insuranceFund), insuranceCut);
+                insuranceFund.depositFee(insuranceCut);
+            }
+        }
+        
+        uint256 aaveSupplyAmount = totalRepayment - insuranceCut;
+
+        if (aaveSupplyAmount > 0) {
+            aavePool.supply(address(realUSDC), aaveSupplyAmount, address(this), 0);
+        }
         
         emit LoanRepaid(msg.sender, _amount, _interest);
     }
@@ -143,5 +151,16 @@ contract IgarriLendingVault is ERC20, Ownable, ReentrancyGuard {
         if (supply == 0) return 0;
         uint256 assets18 = totalAssets() * SCALE_FACTOR;
         return (balanceOf(_user) * assets18) / supply;
+    }
+
+    function setInsuranceFund(address _insuranceFund) external onlyOwner {
+        insuranceFund = IIgarriInsuranceFund(_insuranceFund);
+        emit InsuranceFundUpdated(_insuranceFund);
+    }
+
+    function setReserveFactor(uint256 _reserveFactorBps) external onlyOwner {
+        require(_reserveFactorBps <= 10000, "Max 100%");
+        reserveFactorBps = _reserveFactorBps;
+        emit ReserveFactorUpdated(_reserveFactorBps);
     }
 }

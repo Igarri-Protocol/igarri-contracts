@@ -1,12 +1,12 @@
 import { expect } from "chai";
 import pkg from "hardhat";
-const { ethers } = pkg;
+const { ethers, network } = pkg;
 
 describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function () {
   let owner, user1, user2, keeper;
   let serverWallet;
   let realUSDC, yieldToken, aavePool;
-  let igUSDC, vault, lendingVault, factory, market;
+  let igUSDC, vault, lendingVault, factory, market, insuranceFund;
   let chainId;
 
   const DECIMALS_USDC = 6n;
@@ -23,6 +23,35 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       chainId: chainId,
       verifyingContract: await market.getAddress(),
     };
+  }
+
+  // NEW HELPER: For Phase 1 Buy Shares
+  async function signBuyShares(
+    signerWallet,
+    serverWallet,
+    buyer,
+    isYes,
+    shareAmount,
+    nonce,
+    deadline,
+  ) {
+    const domain = await getDomain();
+    const types = {
+      BuyShares: [
+        { name: "buyer", type: "address" },
+        { name: "isYes", type: "bool" },
+        { name: "shareAmount", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+      ],
+    };
+
+    const value = { buyer, isYes, shareAmount, nonce, deadline };
+
+    const userSig = await signerWallet.signTypedData(domain, types, value);
+    const serverSig = await serverWallet.signTypedData(domain, types, value);
+
+    return { userSig, serverSig };
   }
 
   async function signOpenPosition(
@@ -42,7 +71,7 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
         { name: "trader", type: "address" },
         { name: "isYes", type: "bool" },
         { name: "collateral", type: "uint256" },
-        { name: "leverage", type: "uint256" }, // Added
+        { name: "leverage", type: "uint256" },
         { name: "minShares", type: "uint256" },
         { name: "nonce", type: "uint256" },
         { name: "deadline", type: "uint256" },
@@ -160,6 +189,40 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       await factory.getAddress(),
     );
 
+    const InsuranceFund = await ethers.getContractFactory(
+      "IgarriInsuranceFund",
+    );
+    insuranceFund = await InsuranceFund.deploy(
+      await realUSDC.getAddress(),
+      await factory.getAddress(),
+      await aavePool.getAddress(),
+      await yieldToken.getAddress(),
+    );
+
+    await factory.setIgarriInsuranceFund(await insuranceFund.getAddress());
+    await lendingVault.setInsuranceFund(await insuranceFund.getAddress());
+    await lendingVault.setReserveFactor(1000);
+
+    const factoryAddress = await factory.getAddress();
+    await network.provider.request({
+      method: "hardhat_impersonateAccount",
+      params: [factoryAddress],
+    });
+    await network.provider.send("hardhat_setBalance", [
+      factoryAddress,
+      "0x10000000000000000000",
+    ]);
+    const factorySigner = await ethers.getSigner(factoryAddress);
+
+    await insuranceFund
+      .connect(factorySigner)
+      .setAllowedMarket(await lendingVault.getAddress(), true);
+
+    await network.provider.request({
+      method: "hardhat_stopImpersonatingAccount",
+      params: [factoryAddress],
+    });
+
     await vault.setIgarriUSDC(await igUSDC.getAddress());
     await vault.setIgarriMarketFactory(await factory.getAddress());
     await vault.setLendingVault(await lendingVault.getAddress());
@@ -180,6 +243,7 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       MIGRATION_THRESHOLD,
       await lendingVault.getAddress(),
       serverWallet.address,
+      await insuranceFund.getAddress(),
     ]);
 
     const tx = await factory.deployMarket(
@@ -239,10 +303,33 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
         .connect(user2)
         .approve(await market.getAddress(), ethers.MaxUint256);
 
-      await expect(market.connect(user1).buyShares(true, buyAmount)).to.emit(
-        market,
-        "Migrated",
+      // --- FIXED: Added Signature Generation for buyShares ---
+      const nonce = await market.nonces(user1.address);
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+      const { userSig, serverSig } = await signBuyShares(
+        user1,
+        serverWallet,
+        user1.address,
+        true,
+        buyAmount,
+        nonce,
+        deadline,
       );
+
+      await expect(
+        market
+          .connect(user1)
+          .buyShares(
+            user1.address,
+            true,
+            buyAmount,
+            deadline,
+            userSig,
+            serverSig,
+          ),
+      ).to.emit(market, "Migrated");
+
       expect(await market.phase2Active()).to.be.true;
     });
 
@@ -257,7 +344,7 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
 
   describe("Step 2: Dual Position Trading (With Signatures)", function () {
     const COLLATERAL = 1000n * 10n ** 6n;
-    const LEVERAGE = 5n; // Passing 5x leverage explicitly
+    const LEVERAGE = 5n;
 
     it("User1 should open a LONG YES position via Signature (5x)", async function () {
       const nonce = await market.nonces(user1.address);
@@ -364,7 +451,6 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
       const nonce = await market.nonces(keeper.address);
 
-      // Sign using updated simpler method
       const serverSig = await signBulkLiquidate(
         serverWallet,
         traders,

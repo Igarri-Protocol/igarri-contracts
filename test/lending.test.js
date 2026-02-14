@@ -3,9 +3,9 @@ import pkg from "hardhat";
 const { ethers } = pkg;
 
 describe("Igarri Lending Vault (Isolated)", function () {
-  let owner, user;
+  let owner, user, dummyMarket;
   let realUSDC, yieldToken, aavePool;
-  let igUSDC, vault, lendingVault;
+  let igUSDC, vault, lendingVault, insuranceFund;
 
   // Configuration
   const DECIMALS_USDC = 6;
@@ -14,7 +14,7 @@ describe("Igarri Lending Vault (Isolated)", function () {
   const EXPECTED_IG_USDC = ethers.parseUnits("1000", DECIMALS_IG); // 1000 igUSDC
 
   beforeEach(async function () {
-    [owner, user] = await ethers.getSigners();
+    [owner, user, dummyMarket] = await ethers.getSigners();
 
     // 1. Deploy Mocks
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
@@ -54,23 +54,40 @@ describe("Igarri Lending Vault (Isolated)", function () {
       await vault.getAddress(),
       await aavePool.getAddress(),
       await yieldToken.getAddress(),
-      owner.address,
+      owner.address, // owner acts as marketFactory for testing
     );
     await lendingVault.waitForDeployment();
 
-    // ================== THE FIX IS HERE ==================
-    // We explicitly allow the Lending Vault to transfer igUSDC from users
+    // ================== NEW: Deploy Insurance Fund ==================
+    const InsuranceFund = await ethers.getContractFactory(
+      "IgarriInsuranceFund",
+    );
+    insuranceFund = await InsuranceFund.deploy(
+      await realUSDC.getAddress(),
+      owner.address, // owner acts as marketFactory here too
+      await aavePool.getAddress(),
+      await yieldToken.getAddress(),
+    );
+    await insuranceFund.waitForDeployment();
+
+    // Wire the Insurance Fund to the Lending Vault
+    await lendingVault.setInsuranceFund(await insuranceFund.getAddress());
+    // Set default reserve factor to 10% (1000 BPS)
+    await lendingVault.setReserveFactor(1000);
+    // ================================================================
+
+    await insuranceFund
+      .connect(owner)
+      .setAllowedMarket(await lendingVault.getAddress(), true);
+
+    // 5. Wire Permissions
     await igUSDC
       .connect(owner)
       .addAllowedMarket(await lendingVault.getAddress());
-    // =====================================================
-
-    // 5. Wire Permissions (Crucial Step)
     await vault.setIgarriUSDC(await igUSDC.getAddress());
-    await vault.setLendingVault(await lendingVault.getAddress()); // Allow LendingVault to pull funds
+    await vault.setLendingVault(await lendingVault.getAddress());
 
     // 6. User Setup: Get initial igUSDC
-    // Mint Real USDC -> Approve Vault -> Deposit -> Get igUSDC
     await realUSDC.mint(user.address, INITIAL_DEPOSIT);
     await realUSDC
       .connect(user)
@@ -79,45 +96,26 @@ describe("Igarri Lending Vault (Isolated)", function () {
   });
 
   it("Should have correct initial state", async function () {
-    // User should have 1000 igUSDC
     expect(await igUSDC.balanceOf(user.address)).to.equal(EXPECTED_IG_USDC);
-
-    // Vault should have 1000 realUSDC (held in Aave)
     expect(await vault.totalRealUSDCInVault()).to.equal(INITIAL_DEPOSIT);
-
-    // Lending Vault should be empty
     expect(await lendingVault.totalAssets()).to.equal(0);
+    // Ensure Insurance Fund starts empty
+    expect(await insuranceFund.totalAssets()).to.equal(0);
   });
 
   it("Should atomically move realUSDC to Aave when user stakes igUSDC", async function () {
-    const stakeAmount = EXPECTED_IG_USDC; // 1000 igUSDC
+    const stakeAmount = EXPECTED_IG_USDC;
 
-    // 1. Approve Lending Vault to take user's igUSDC
     await igUSDC
       .connect(user)
       .approve(await lendingVault.getAddress(), stakeAmount);
-
-    // 2. Stake
     await expect(lendingVault.connect(user).stake(stakeAmount))
       .to.emit(lendingVault, "Staked")
       .withArgs(user.address, stakeAmount, stakeAmount);
 
-    // --- VERIFICATION ---
-
-    // A. User Logic
-    // User should have 0 igUSDC left
     expect(await igUSDC.balanceOf(user.address)).to.equal(0);
-    // User should have 1000 igLP tokens
     expect(await lendingVault.balanceOf(user.address)).to.equal(stakeAmount);
-
-    // B. Main Vault Logic
-    // Vault 'totalRealUSDCInVault' should decrease by 1000
-    // Because it sent the backing assets to the Lending Vault
     expect(await vault.totalRealUSDCInVault()).to.equal(0);
-
-    // C. Lending Vault Logic
-    // Lending Vault should now hold the value in Aave (via yieldTokens)
-    // 1000 igUSDC = 1000 realUSDC (6 decimals)
     expect(
       await yieldToken.balanceOf(await lendingVault.getAddress()),
     ).to.equal(INITIAL_DEPOSIT);
@@ -130,16 +128,8 @@ describe("Igarri Lending Vault (Isolated)", function () {
       .approve(await lendingVault.getAddress(), stakeAmount);
     await lendingVault.connect(user).stake(stakeAmount);
 
-    // 1. Simulate Interest in Aave
-    // The Lending Vault holds 1000 aUSDC. Let's add 100 aUSDC as "interest".
     const interest = ethers.parseUnits("100", DECIMALS_USDC);
     await aavePool.simulateInterest(await lendingVault.getAddress(), interest);
-
-    // 2. Check Preview
-    // Total Assets = 1000 + 100 = 1100 aUSDC
-    // User Shares = 1000
-    // Total Supply = 1000
-    // Result = (1000 * 1100) / 1000 = 1100 (in 18 decimals)
 
     const expectedBalance = ethers.parseUnits("1100", DECIMALS_IG);
     const actualBalance = await lendingVault.previewUserBalance(user.address);
@@ -154,32 +144,71 @@ describe("Igarri Lending Vault (Isolated)", function () {
       .approve(await lendingVault.getAddress(), stakeAmount);
     await lendingVault.connect(user).stake(stakeAmount);
 
-    // 1. Simulate Interest (10% gain)
-    const interest = ethers.parseUnits("100", DECIMALS_USDC); // 100 realUSDC profit
+    const interest = ethers.parseUnits("100", DECIMALS_USDC);
 
-    // A. Mint the virtual yield (aTokens)
     await aavePool.simulateInterest(await lendingVault.getAddress(), interest);
-
-    // ================== THE FIX IS HERE ==================
-    // B. Mint the REAL backing cash to the Aave Pool so it's solvent
     await realUSDC.mint(await aavePool.getAddress(), interest);
-    // =====================================================
 
-    // 2. Unstake All
-    // User has 1000 LP tokens.
     await lendingVault.connect(user).unstake(stakeAmount);
+
+    const expectedReturn = ethers.parseUnits("1100", DECIMALS_IG);
+    expect(await igUSDC.balanceOf(user.address)).to.equal(expectedReturn);
+    expect(await lendingVault.totalSupply()).to.equal(0);
+
+    const expectedVaultBal = ethers.parseUnits("1100", DECIMALS_USDC);
+    expect(await vault.totalRealUSDCInVault()).to.equal(expectedVaultBal);
+  });
+
+  // =========================================================================
+  // NEW TEST: Ensure Reserve Factor correctly funds the Insurance Pool
+  // =========================================================================
+  it("Should route a percentage of repaid interest to the Insurance Fund", async function () {
+    // 1. User stakes funds so the Lending Vault has liquidity
+    const stakeAmount = EXPECTED_IG_USDC;
+    await igUSDC
+      .connect(user)
+      .approve(await lendingVault.getAddress(), stakeAmount);
+    await lendingVault.connect(user).stake(stakeAmount);
+
+    // 2. Setup a Dummy Market and allow it to borrow
+    await lendingVault.connect(owner).addAllowedMarket(dummyMarket.address);
+
+    // 3. Dummy Market borrows 500 USDC
+    const loanAmount = ethers.parseUnits("500", DECIMALS_USDC);
+    await lendingVault.connect(dummyMarket).fundLoan(loanAmount);
+
+    // Verify market received the physical USDC
+    expect(await realUSDC.balanceOf(dummyMarket.address)).to.equal(loanAmount);
+
+    // 4. Time passes... Market needs to repay loan + 100 USDC interest
+    const interestAmount = ethers.parseUnits("100", DECIMALS_USDC);
+
+    // Mint the extra 100 USDC to the market to simulate winning/interest gathering
+    await realUSDC.mint(dummyMarket.address, interestAmount);
+    const totalRepayment = loanAmount + interestAmount;
+
+    // 5. Repay the Loan
+    await realUSDC
+      .connect(dummyMarket)
+      .approve(await lendingVault.getAddress(), totalRepayment);
+    await lendingVault
+      .connect(dummyMarket)
+      .repayLoan(loanAmount, interestAmount);
 
     // --- VERIFICATION ---
 
-    // User should get 1100 igUSDC back (Original + Yield)
-    const expectedReturn = ethers.parseUnits("1100", DECIMALS_IG);
-    expect(await igUSDC.balanceOf(user.address)).to.equal(expectedReturn);
+    // Total interest was 100. Reserve factor is 10% (1000 BPS).
+    // Expected Insurance Cut = 10 USDC
+    const expectedInsuranceCut = ethers.parseUnits("10", DECIMALS_USDC);
 
-    // Lending Vault should be empty
-    expect(await lendingVault.totalSupply()).to.equal(0);
+    // The Insurance Fund should now hold 10 USDC worth of yield tokens in Aave
+    expect(await insuranceFund.totalAssets()).to.equal(expectedInsuranceCut);
 
-    // Main Vault should have the funds back (1100 realUSDC)
-    const expectedVaultBal = ethers.parseUnits("1100", DECIMALS_USDC);
-    expect(await vault.totalRealUSDCInVault()).to.equal(expectedVaultBal);
+    // The Lending Vault should have received the principal (500) + remaining interest (90)
+    // Plus the 500 it still held that wasn't loaned out = 1090 total in Aave
+    const expectedLendingVaultAssets = ethers.parseUnits("1090", DECIMALS_USDC);
+    expect(
+      await yieldToken.balanceOf(await lendingVault.getAddress()),
+    ).to.equal(expectedLendingVaultAssets);
   });
 });

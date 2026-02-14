@@ -26,14 +26,16 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
     // --- Configuration ---
     uint256 public constant K = 100;
     uint256 public constant INSURANCE_FEE_BPS = 50;
-    // UPDATED: Renamed to MAX_LEVERAGE
     uint256 public constant MAX_LEVERAGE = 5; 
     uint256 public constant LIQUIDATION_THRESHOLD = 12000;
     uint256 public constant BPS = 10000;
     uint256 public constant SCALE_FACTOR = 10**12;
 
     // --- TypeHashes ---
-    // UPDATED: Added 'uint256 leverage' to the typehash
+    bytes32 private constant BUY_SHARES_TYPEHASH = keccak256(
+        "BuyShares(address buyer,bool isYes,uint256 shareAmount,uint256 nonce,uint256 deadline)"
+    );
+
     bytes32 private constant OPEN_POSITION_TYPEHASH = keccak256(
         "OpenPosition(address trader,bool isYes,uint256 collateral,uint256 leverage,uint256 minShares,uint256 nonce,uint256 deadline)"
     );
@@ -135,7 +137,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         emit ServerSignerUpdated(_newSigner);
     }
 
-    // --- PHASE 1 (Unchanged) ---
+    // --- PHASE 1 (UPDATED with Server Signatures) ---
     function getCurrentPrice() public view returns (uint256) {
         return (K * currentSupply) / 1e6;
     }
@@ -147,10 +149,34 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         fee = (rawCost * INSURANCE_FEE_BPS) / 10000;
     }
 
-    function buyShares(bool _isYes, uint256 _shareAmount) external nonReentrant {
+    function buyShares(
+        address _buyer,
+        bool _isYes, 
+        uint256 _shareAmount, 
+        uint256 _deadline,
+        bytes calldata _userSignature, 
+        bytes calldata _serverSignature
+    ) external nonReentrant {
+        if (block.timestamp > _deadline) revert SignatureExpired();
         require(!migrated, "Market migrated");
+
+        bytes32 structHash = keccak256(abi.encode(
+            BUY_SHARES_TYPEHASH, 
+            _buyer, 
+            _isYes, 
+            _shareAmount, 
+            _useNonce(_buyer), 
+            _deadline
+        ));
+
+        bytes32 digest = _hashTypedDataV4(structHash);
+        
+        if (!SignatureChecker.isValidSignatureNow(_buyer, digest, _userSignature)) revert InvalidSignature();
+        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSignature)) revert InvalidSignature();
+
         uint256 finalShareAmount = _shareAmount;
         (uint256 rawCost, uint256 fee) = getQuote(_shareAmount);
+        
         if (totalCapital + rawCost > migrationThreshold) {
             uint256 neededCapital = migrationThreshold - totalCapital;
             uint256 sStart = currentSupply;
@@ -162,12 +188,15 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
             }
         }
         uint256 totalCost = rawCost + fee;
-        igUSDC.transferFrom(msg.sender, address(this), totalCost);
+        igUSDC.transferFrom(_buyer, address(this), totalCost);
         currentSupply += finalShareAmount;
         totalCapital += rawCost;
-        if (_isYes) yesToken.mint(msg.sender, finalShareAmount);
-        else noToken.mint(msg.sender, finalShareAmount);
-        emit BulkBuy(msg.sender, _isYes, totalCost, finalShareAmount);
+        
+        if (_isYes) yesToken.mint(_buyer, finalShareAmount);
+        else noToken.mint(_buyer, finalShareAmount);
+        
+        emit BulkBuy(_buyer, _isYes, totalCost, finalShareAmount);
+        
         if (totalCapital >= migrationThreshold) _migrate();
     }
 
@@ -188,6 +217,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         emit Phase2Activated(_initialLiquidity, constantProductK);
     }
 
+    // --- PHASE 2 ---
     function openPosition(
         address _trader, 
         bool _isYes, 

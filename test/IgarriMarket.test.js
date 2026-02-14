@@ -1,23 +1,69 @@
 import { expect } from "chai";
 import pkg from "hardhat";
-const { ethers } = pkg;
+const { ethers, network } = pkg;
 
 describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
-  let owner,
-    user,
-    realUSDC,
-    yieldToken,
-    aavePool,
-    igUSDC,
+  let owner, user, serverWallet;
+  let realUSDC, yieldToken, aavePool;
+  let igUSDC,
     vault,
+    lendingVault,
+    insuranceFund,
     factory,
     singleton,
     marketProxy;
+  let chainId;
 
-  const THRESHOLD = ethers.parseUnits("50000", 18);
+  // Set to 50,000 USDC (6 decimals). The contract will multiply by SCALE_FACTOR internally.
+  const THRESHOLD = 50_000n * 10n ** 6n;
+
+  // --- EIP-712 HELPERS ---
+  async function getDomain() {
+    return {
+      name: "IgarriMarket",
+      version: "1",
+      chainId: chainId,
+      verifyingContract: await marketProxy.getAddress(),
+    };
+  }
+
+  async function signBuyShares(
+    signerWallet,
+    serverWallet,
+    buyer,
+    isYes,
+    shareAmount,
+    nonce,
+    deadline,
+  ) {
+    const domain = await getDomain();
+    const types = {
+      BuyShares: [
+        { name: "buyer", type: "address" },
+        { name: "isYes", type: "bool" },
+        { name: "shareAmount", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+      ],
+    };
+
+    const value = { buyer, isYes, shareAmount, nonce, deadline };
+
+    const userSig = await signerWallet.signTypedData(domain, types, value);
+    const serverSig = await serverWallet.signTypedData(domain, types, value);
+
+    return { userSig, serverSig };
+  }
 
   before(async function () {
     [owner, user] = await ethers.getSigners();
+    chainId = (await ethers.provider.getNetwork()).chainId;
+
+    // Setup the mock server wallet for signing
+    serverWallet = new ethers.Wallet(
+      "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
+      ethers.provider,
+    );
 
     // 1. Deploy Mocks
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
@@ -45,22 +91,73 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       await factory.getAddress(),
     );
 
-    // 3. Link Dependencies & Permissions
+    // 3. Deploy Missing Dependencies for New Architecture
+    const LendingVault = await ethers.getContractFactory("IgarriLendingVault");
+    lendingVault = await LendingVault.deploy(
+      await igUSDC.getAddress(),
+      await realUSDC.getAddress(),
+      await vault.getAddress(),
+      await aavePool.getAddress(),
+      await yieldToken.getAddress(),
+      await factory.getAddress(),
+    );
+
+    const InsuranceFund = await ethers.getContractFactory(
+      "IgarriInsuranceFund",
+    );
+    insuranceFund = await InsuranceFund.deploy(
+      await realUSDC.getAddress(),
+      await factory.getAddress(),
+      await aavePool.getAddress(),
+      await yieldToken.getAddress(),
+    );
+
+    // 4. Link Dependencies & Permissions
     await vault.setIgarriUSDC(await igUSDC.getAddress());
     await vault.setIgarriMarketFactory(await factory.getAddress());
+    await vault.setLendingVault(await lendingVault.getAddress());
+
     await factory.setIgarriUSDC(await igUSDC.getAddress());
     await factory.setIgarriVault(await vault.getAddress());
+    await factory.setIgarriLendingVault(await lendingVault.getAddress());
+    await factory.setIgarriInsuranceFund(await insuranceFund.getAddress());
 
-    // 4. Deploy Market Singleton and Proxy
+    await igUSDC
+      .connect(owner)
+      .addAllowedMarket(await lendingVault.getAddress());
+
+    // Impersonate Factory to authorize lending vault on Insurance Fund
+    const factoryAddress = await factory.getAddress();
+    await network.provider.request({
+      method: "hardhat_impersonateAccount",
+      params: [factoryAddress],
+    });
+    await network.provider.send("hardhat_setBalance", [
+      factoryAddress,
+      "0x10000000000000000000",
+    ]);
+    const factorySigner = await ethers.getSigner(factoryAddress);
+    await insuranceFund
+      .connect(factorySigner)
+      .setAllowedMarket(await lendingVault.getAddress(), true);
+    await network.provider.request({
+      method: "hardhat_stopImpersonatingAccount",
+      params: [factoryAddress],
+    });
+
+    // 5. Deploy Market Singleton and Proxy
     const Market = await ethers.getContractFactory("IgarriMarket");
     singleton = await Market.deploy();
 
+    // UPDATED: Include all 7 arguments required by the new initialize function
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
       await vault.getAddress(),
       "BTC-MOON",
       THRESHOLD,
-      await aavePool.getAddress(), // New parameter
+      await lendingVault.getAddress(),
+      serverWallet.address,
+      await insuranceFund.getAddress(),
     ]);
 
     const tx = await factory.deployMarket(
@@ -70,7 +167,6 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
     );
     const receipt = await tx.wait();
 
-    // Find Proxy address from logs
     const event = receipt.logs
       .map((log) => {
         try {
@@ -94,15 +190,10 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       "Deposited",
     );
 
-    // Check Vault tracking
     expect(await vault.totalRealUSDCInVault()).to.equal(amount);
-
-    // Check Aave Mock received the funds
     expect(await realUSDC.balanceOf(await aavePool.getAddress())).to.equal(
       amount,
     );
-
-    // Check Vault received yield tokens (aTokens)
     expect(await yieldToken.balanceOf(await vault.getAddress())).to.equal(
       amount,
     );
@@ -110,12 +201,31 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
 
   it("Should buy shares and maintain bonding curve capital", async function () {
     const buyAmount = ethers.parseUnits("10", 10);
-    // User already has igUSDC from previous test deposit
 
-    await expect(marketProxy.connect(user).buyShares(true, buyAmount)).to.emit(
-      marketProxy,
-      "BulkBuy",
+    // User must approve the market to pull their igUSDC
+    await igUSDC
+      .connect(user)
+      .approve(await marketProxy.getAddress(), ethers.MaxUint256);
+
+    // --- Generate EIP-712 Signatures ---
+    const nonce = await marketProxy.nonces(user.address);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+    const { userSig, serverSig } = await signBuyShares(
+      user,
+      serverWallet,
+      user.address,
+      true,
+      buyAmount,
+      nonce,
+      deadline,
     );
+
+    // Execute the signed transaction
+    await expect(
+      marketProxy
+        .connect(user)
+        .buyShares(user.address, true, buyAmount, deadline, userSig, serverSig),
+    ).to.emit(marketProxy, "BulkBuy");
 
     expect(await marketProxy.currentSupply()).to.equal(buyAmount);
   });
@@ -126,7 +236,6 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
 
     const initialTreasuryBalance = await realUSDC.balanceOf(owner.address);
 
-    // Withdraw yields to owner
     await vault.withdrawYields(owner.address);
 
     const finalTreasuryBalance = await realUSDC.balanceOf(owner.address);
@@ -142,17 +251,33 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       .approve(await vault.getAddress(), whaleDeposit);
     await vault.connect(user).deposit(whaleDeposit);
 
-    // 2. Buy enough to hit threshold
+    // 2. Generate signatures for a massive buy to trigger migration
     const bigAmount = ethers.parseUnits("2000000", 18);
-    await marketProxy.connect(user).buyShares(true, bigAmount);
+    const nonce = await marketProxy.nonces(user.address);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
 
+    const { userSig, serverSig } = await signBuyShares(
+      user,
+      serverWallet,
+      user.address,
+      true,
+      bigAmount,
+      nonce,
+      deadline,
+    );
+
+    // 3. Execute the buy
+    await marketProxy
+      .connect(user)
+      .buyShares(user.address, true, bigAmount, deadline, userSig, serverSig);
+
+    // Verify Migration Success
     expect(await marketProxy.migrated()).to.be.true;
 
     // Verify market proxy now holds the real USDC (withdrawn from Aave during migration)
     const marketBalance = await realUSDC.balanceOf(
       await marketProxy.getAddress(),
     );
-
-    expect(marketBalance).to.be.at.least(ethers.parseUnits("50000", 6));
+    expect(marketBalance).to.be.at.least(THRESHOLD);
   });
 });

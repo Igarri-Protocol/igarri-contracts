@@ -16,6 +16,7 @@ interface IIgarriVault {
     function igarriMarketFactory() external view returns (address);
     function allowedMarkets(address market) external view returns (bool);
     function SCALE_FACTOR() external view returns (uint256);
+    function totalRealUSDCInVault() external view returns (uint256);
 
     // --- Core Functions ---
     function deposit(uint256 _amount) external;

@@ -83,6 +83,15 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
     mapping(address => mapping(bool => LeveragedPosition)) public positions;
     uint256 public totalBorrowed;
 
+    bool public marketResolved;
+    bool public winningOutcomeIsYes;
+    uint256 public settlementPrice18;
+
+    enum UserTier { Standard, Early, FanToken }
+
+    uint256 public phase2YesOI;
+    uint256 public phase2NoOI;
+
     // --- Events ---
     event BulkBuy(address indexed user, bool isYes, uint256 igUSDCCost, uint256 sharesMinted);
     event Migrated(uint256 finalCapital, uint256 finalSupply);
@@ -93,7 +102,28 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
     event Rebalanced(bool isYesSide, uint256 newVUSDC, uint256 newVToken);
     event BulkLiquidationExecuted(uint256 count);
     event ServerSignerUpdated(address newSigner); 
+    event MarketResolved(bool isYesWinner, uint256 settlementPrice18);
+    event WinningsClaimed(address indexed user, bool isPhase1, uint256 totalPayoutUSDC);
 
+    // --- Custom Errors ---
+    error AlreadyInitialized();
+    error NotAuthorized();
+    error MarketMigrated();
+    error ActivePositionExists();
+    error MinCollateralNotMet();
+    error InvalidLeverage();
+    error SlippageExceeded();
+    error NoActivePosition();
+    error ArrayLengthMismatch();
+    error PositionIsHealthy();
+    error MarketAlreadyResolved();
+    error MarketNotResolved();
+    error NoWinningPhase1Shares();
+    error NoWinningPhase2Position();
+    error ZeroPayout();
+    error ZeroShares();
+    error ZeroReturn();
+    error Phase2NotActive();
     error InvalidSignature();
     error SignatureExpired();
     error AccessDenied();
@@ -102,9 +132,22 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         igUSDC = IIgarriUSDC(address(0x1));
     }
 
-    modifier onlyPhase2() { require(phase2Active, "Phase 2 not active"); _; }
+    // --- Modifiers ---
+    function _checkPhase2() internal view {
+        if (!phase2Active) revert Phase2NotActive();
+    }
+    
+    function _checkNoActivePosition(bool _isYes) internal view {
+        if (positions[msg.sender][_isYes].active) revert ActivePositionExists();
+    }
+
+    modifier onlyPhase2() { 
+        _checkPhase2(); 
+        _; 
+    }
+
     modifier noActivePosition(bool _isYes) { 
-        require(!positions[msg.sender][_isYes].active, "Active position exists"); 
+        _checkNoActivePosition(_isYes); 
         _; 
     }
 
@@ -117,7 +160,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         address _serverSigner,
         address _insuranceFund
     ) external {
-        require(address(igUSDC) == address(0), "Already initialized");
+        if (address(igUSDC) != address(0)) revert AlreadyInitialized();
         igUSDC = IIgarriUSDC(_igUSDC);
         vault = IIgarriVault(_vault);
         lendingVault = IIgarriLendingVault(_lendingVault);
@@ -132,12 +175,12 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
     }
 
     function setServerSigner(address _newSigner) external {
-        require(msg.sender == serverSigner, "Not authorized");
+        if (msg.sender != serverSigner) revert NotAuthorized();
         serverSigner = _newSigner;
         emit ServerSignerUpdated(_newSigner);
     }
 
-    // --- PHASE 1 (UPDATED with Server Signatures) ---
+    // --- PHASE 1 ---
     function getCurrentPrice() public view returns (uint256) {
         return (K * currentSupply) / 1e6;
     }
@@ -158,21 +201,10 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         bytes calldata _serverSignature
     ) external nonReentrant {
         if (block.timestamp > _deadline) revert SignatureExpired();
-        require(!migrated, "Market migrated");
+        if (migrated) revert MarketMigrated();
 
-        bytes32 structHash = keccak256(abi.encode(
-            BUY_SHARES_TYPEHASH, 
-            _buyer, 
-            _isYes, 
-            _shareAmount, 
-            _useNonce(_buyer), 
-            _deadline
-        ));
-
-        bytes32 digest = _hashTypedDataV4(structHash);
-        
-        if (!SignatureChecker.isValidSignatureNow(_buyer, digest, _userSignature)) revert InvalidSignature();
-        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSignature)) revert InvalidSignature();
+        bytes32 structHash = keccak256(abi.encode(BUY_SHARES_TYPEHASH, _buyer, _isYes, _shareAmount, _useNonce(_buyer), _deadline));
+        _verifySigs(_buyer, structHash, _userSignature, _serverSignature);
 
         uint256 finalShareAmount = _shareAmount;
         (uint256 rawCost, uint256 fee) = getQuote(_shareAmount);
@@ -229,25 +261,12 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         bytes calldata _serverSignature
     ) external nonReentrant onlyPhase2 {
         if (block.timestamp > _deadline) revert SignatureExpired();
-        require(!positions[_trader][_isYes].active, "Active position exists");
-        require(_collateral >= 10**6, "Min 1 USDC");
-        require(_leverage >= 1 && _leverage <= MAX_LEVERAGE, "Invalid leverage");
+        if (positions[_trader][_isYes].active) revert ActivePositionExists();
+        if (_collateral < 10**6) revert MinCollateralNotMet();
+        if (_leverage < 1 || _leverage > MAX_LEVERAGE) revert InvalidLeverage();
 
-        bytes32 structHash = keccak256(abi.encode(
-            OPEN_POSITION_TYPEHASH, 
-            _trader, 
-            _isYes, 
-            _collateral,
-            _leverage, 
-            _minSharesExpected, 
-            _useNonce(_trader), 
-            _deadline
-        ));
-
-        bytes32 digest = _hashTypedDataV4(structHash);
-        
-        if (!SignatureChecker.isValidSignatureNow(_trader, digest, _userSignature)) revert InvalidSignature();
-        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSignature)) revert InvalidSignature();
+        bytes32 structHash = keccak256(abi.encode(OPEN_POSITION_TYPEHASH, _trader, _isYes, _collateral, _leverage, _minSharesExpected, _useNonce(_trader), _deadline));
+        _verifySigs(_trader, structHash, _userSignature, _serverSignature);
 
         uint256 collateral18 = _collateral * SCALE_FACTOR;
         igUSDC.transferFrom(_trader, address(this), collateral18);
@@ -255,13 +274,11 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         vault.redeem(collateral18);
 
         uint256 loanAmount = _collateral * (_leverage - 1);
-        if (loanAmount > 0) {
-            lendingVault.fundLoan(loanAmount);
-        }
+        if (loanAmount > 0) lendingVault.fundLoan(loanAmount);
 
         uint256 totalPositionUSDC = _collateral * _leverage * SCALE_FACTOR;
         uint256 sharesReceived = _buyFromvAMM(_isYes, totalPositionUSDC);
-        require(sharesReceived >= _minSharesExpected, "Slippage");
+        if (sharesReceived < _minSharesExpected) revert SlippageExceeded();
         
         positions[_trader][_isYes] = LeveragedPosition({
             collateral: _collateral,
@@ -271,33 +288,33 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
             entryPrice: getCurrentPrice(_isYes),
             active: true
         });
+        
         totalBorrowed += loanAmount;
+        _updateOI(_isYes, sharesReceived, true);
+
         emit PositionOpened(_trader, _isYes, _collateral, loanAmount, sharesReceived, positions[_trader][_isYes].entryPrice);
     }
 
     function closePosition(address _trader, bool _isYes, uint256 _minUSDCReturned, uint256 _deadline, bytes calldata _userSignature, bytes calldata _serverSignature) external nonReentrant onlyPhase2 {
         if (block.timestamp > _deadline) revert SignatureExpired();
-        bytes32 structHash = keccak256(abi.encode(CLOSE_POSITION_TYPEHASH, _trader, _isYes, _minUSDCReturned, _useNonce(_trader), _deadline));
-        bytes32 digest = _hashTypedDataV4(structHash);
         
-        if (!SignatureChecker.isValidSignatureNow(_trader, digest, _userSignature)) revert InvalidSignature();
-        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSignature)) revert InvalidSignature();
+        bytes32 structHash = keccak256(abi.encode(CLOSE_POSITION_TYPEHASH, _trader, _isYes, _minUSDCReturned, _useNonce(_trader), _deadline));
+        _verifySigs(_trader, structHash, _userSignature, _serverSignature);
 
         LeveragedPosition storage pos = positions[_trader][_isYes];
-        require(pos.active, "No active position");
+        if (!pos.active) revert NoActivePosition();
+
         uint256 usdcReturned18 = _sellTovAMM(_isYes, pos.shares);
-        require(usdcReturned18 >= _minUSDCReturned, "Slippage");
+        if (usdcReturned18 < _minUSDCReturned) revert SlippageExceeded();
+
         uint256 usdcReturned6 = usdcReturned18 / SCALE_FACTOR;
         uint256 amountToRepay = usdcReturned6 >= pos.loanAmount ? pos.loanAmount : usdcReturned6;
         uint256 userPayout6 = usdcReturned6 > pos.loanAmount ? usdcReturned6 - pos.loanAmount : 0;
 
-        if (amountToRepay > 0) lendingVault.repayLoan(amountToRepay, 0);
-        if (userPayout6 > 0) {
-            vault.deposit(userPayout6);
-            uint256 igMinted = userPayout6 * SCALE_FACTOR;
-            igUSDC.transfer(_trader, igMinted);
-        }
-        totalBorrowed -= amountToRepay;
+        _repayLoan(amountToRepay);
+        _payoutRoute(_trader, userPayout6);
+        _updateOI(_isYes, pos.shares, false);
+
         pos.active = false;
         emit PositionClosed(_trader, _isYes, userPayout6, amountToRepay, int256(userPayout6) - int256(pos.collateral));
     }
@@ -314,20 +331,11 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         bytes calldata _serverSignature
     ) external nonReentrant onlyPhase2 returns (uint256 liquidatedCount) {
         if (block.timestamp > _deadline) revert SignatureExpired();
-        require(_traders.length == _isYesSides.length, "Mismatch");
+        if (_traders.length != _isYesSides.length) revert ArrayLengthMismatch();
 
         bytes32 payloadHash = keccak256(abi.encode(_traders, _isYesSides));
-
-        bytes32 structHash = keccak256(abi.encode(
-            BULK_LIQUIDATE_TYPEHASH,
-            payloadHash,
-            _useNonce(msg.sender), 
-            _deadline
-        ));
-
-        bytes32 digest = _hashTypedDataV4(structHash);
-        
-        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSignature)) revert InvalidSignature();
+        bytes32 structHash = keccak256(abi.encode(BULK_LIQUIDATE_TYPEHASH, payloadHash, _useNonce(msg.sender), _deadline));
+        _verifyServerSig(structHash, _serverSignature);
 
         liquidatedCount = 0;
         for (uint i = 0; i < _traders.length; i++) {
@@ -342,8 +350,8 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
 
     function _liquidate(address _trader, bool _isYes, address _keeper) internal {
         LeveragedPosition storage pos = positions[_trader][_isYes];
-        require(pos.active, "No active position");
-        require(getHealthFactor(_trader, _isYes) < BPS, "Healthy");
+        if (!pos.active) revert NoActivePosition();
+        if (getHealthFactor(_trader, _isYes) >= BPS) revert PositionIsHealthy();
 
         uint256 usdcReturned18 = _sellTovAMM(_isYes, pos.shares);
         uint256 usdcReturned6 = usdcReturned18 / SCALE_FACTOR;
@@ -356,8 +364,6 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
             uint256 shortfall = pos.loanAmount - usdcReturned6;
             insuranceFund.coverBadDebt(shortfall);
             amountToRepay = pos.loanAmount; 
-            keeperReward = 0;
-            traderRefund = 0;
         } else {
             amountToRepay = pos.loanAmount;
             uint256 surplus = usdcReturned6 - pos.loanAmount;
@@ -373,20 +379,113 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
             traderRefund = remainingSurplus - keeperReward;
         }
 
-        if (amountToRepay > 0) lendingVault.repayLoan(amountToRepay, 0);
+        _repayLoan(amountToRepay);
+        _payoutRoute(_keeper, keeperReward);
+        _payoutRoute(_trader, traderRefund);
+        _updateOI(_isYes, pos.shares, false);
 
-        if (keeperReward > 0) {
-            vault.deposit(keeperReward);
-            igUSDC.transfer(_keeper, keeperReward * SCALE_FACTOR);
-        }
-        if (traderRefund > 0) {
-            vault.deposit(traderRefund);
-            igUSDC.transfer(_trader, traderRefund * SCALE_FACTOR);
-        }
-
-        totalBorrowed -= amountToRepay;
         pos.active = false;
         emit PositionLiquidated(_trader, _isYes, _keeper, keeperReward, amountToRepay, traderRefund);
+    }
+    
+    // --- PHASE 3 ---
+    function resolveMarket(bool _winningOutcomeIsYes) external {
+        if (marketResolved) revert MarketAlreadyResolved();
+        
+        marketResolved = true;
+        phase2Active = false; 
+        winningOutcomeIsYes = _winningOutcomeIsYes;
+
+        uint256 totalWinningShares18 = _winningOutcomeIsYes 
+            ? (yesToken.totalSupply() + phase2YesOI) 
+            : (noToken.totalSupply() + phase2NoOI);
+
+        uint256 availableUSDC6 = realUSDC.balanceOf(address(this));
+        uint256 liabilities6 = totalWinningShares18 / SCALE_FACTOR; 
+        
+        if (liabilities6 <= availableUSDC6 || liabilities6 == 0) {
+            settlementPrice18 = 1e18;
+        } else {
+            settlementPrice18 = (availableUSDC6 * 1e18) / liabilities6;
+        }
+
+        emit MarketResolved(_winningOutcomeIsYes, settlementPrice18);
+    }
+
+    function claimWinnings(bool _isPhase1, UserTier _tier) external nonReentrant {
+        if (!marketResolved) revert MarketNotResolved();
+
+        uint256 totalPayout6 = 0;
+
+        if (_isPhase1) {
+            IgarriOutcomeToken winningToken = winningOutcomeIsYes ? yesToken : noToken;
+            uint256 userShares = winningToken.balanceOf(msg.sender);
+            if (userShares == 0) revert NoWinningPhase1Shares();
+
+            winningToken.burn(msg.sender, userShares);
+            totalPayout6 = (userShares * settlementPrice18) / 1e18 / SCALE_FACTOR;
+
+        } else {
+            LeveragedPosition storage pos = positions[msg.sender][winningOutcomeIsYes];
+            if (!pos.active) revert NoWinningPhase2Position();
+
+            uint256 grossValue18 = (pos.shares * settlementPrice18) / 1e18;
+            uint256 grossValue6 = grossValue18 / SCALE_FACTOR;
+
+            uint256 netTradingProfit6 = 0;
+            if (grossValue6 > pos.loanAmount) netTradingProfit6 = grossValue6 - pos.loanAmount;
+    
+            _repayLoan(pos.loanAmount);
+
+            uint256 mockBaseYield6 = (pos.collateral * 5) / 100; 
+            uint256 yieldMultiplier = 10;
+            if (_tier == UserTier.Early) yieldMultiplier = 15;     
+            else if (_tier == UserTier.FanToken) yieldMultiplier = 20; 
+
+            totalPayout6 = pos.collateral + netTradingProfit6 + ((mockBaseYield6 * yieldMultiplier) / 10);
+            
+            _updateOI(winningOutcomeIsYes, pos.shares, false);
+            pos.active = false;
+        }
+
+        if (totalPayout6 == 0) revert ZeroPayout();
+
+        _payoutRoute(msg.sender, totalPayout6);
+        emit WinningsClaimed(msg.sender, _isPhase1, totalPayout6);
+    }
+
+    // --- BYTECODE OPTIMIZATION HELPERS ---
+    function _verifySigs(address _user, bytes32 _structHash, bytes calldata _userSig, bytes calldata _serverSig) internal view {
+        bytes32 digest = _hashTypedDataV4(_structHash);
+        if (!SignatureChecker.isValidSignatureNow(_user, digest, _userSig) || 
+            !SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSig)) revert InvalidSignature();
+    }
+
+    function _verifyServerSig(bytes32 _structHash, bytes calldata _serverSig) internal view {
+        bytes32 digest = _hashTypedDataV4(_structHash);
+        if (!SignatureChecker.isValidSignatureNow(serverSigner, digest, _serverSig)) revert InvalidSignature();
+    }
+
+    function _payoutRoute(address _to, uint256 _amount6) internal {
+        if (_amount6 > 0) {
+            vault.deposit(_amount6);
+            igUSDC.transfer(_to, _amount6 * SCALE_FACTOR);
+        }
+    }
+
+    function _repayLoan(uint256 _amount) internal {
+        if (_amount > 0) {
+            lendingVault.repayLoan(_amount, 0);
+            totalBorrowed -= _amount;
+        }
+    }
+
+    function _updateOI(bool _isYes, uint256 _shares, bool _isAdd) internal {
+        if (_isYes) {
+            if (_isAdd) phase2YesOI += _shares; else phase2YesOI -= _shares;
+        } else {
+            if (_isAdd) phase2NoOI += _shares; else phase2NoOI -= _shares;
+        }
     }
 
     // --- vAMM & VIEW FUNCTIONS ---
@@ -395,40 +494,38 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard, EIP712, 
         uint256 newVUSDC = vUSDC + _usdcAmount18;
         uint256 newVToken = constantProductK / newVUSDC;
         shares = vIn - newVToken;
-        require(shares > 0, "Zero shares");
+        if (shares == 0) revert ZeroShares();
         vUSDC = newVUSDC;
-        if (_isYes) { vYES = newVToken; _rebalanceNO(); } 
-        else { vNO = newVToken; _rebalanceYES(); }
+        if (_isYes) { vYES = newVToken; _rebalance(false); } 
+        else { vNO = newVToken; _rebalance(true); }
         return shares;
     }
 
     function _sellTovAMM(bool _isYes, uint256 _shares) internal returns (uint256 usdcReceived) {
-        require(_shares > 0, "Zero shares");
+        if (_shares == 0) revert ZeroShares();
         uint256 vToken = _isYes ? vYES : vNO;
         uint256 newVToken = vToken + _shares;
         uint256 newVUSDC = constantProductK / newVToken;
         usdcReceived = vUSDC - newVUSDC;
-        require(usdcReceived > 0, "Zero return");
+        if (usdcReceived == 0) revert ZeroReturn();
         vUSDC = newVUSDC;
-        if (_isYes) { vYES = newVToken; _rebalanceNO(); } 
-        else { vNO = newVToken; _rebalanceYES(); }
+        if (_isYes) { vYES = newVToken; _rebalance(false); } 
+        else { vNO = newVToken; _rebalance(true); }
         return usdcReceived;
     }
 
-    function _rebalanceNO() internal {
-        uint256 priceYES = (vUSDC * 1e18) / vYES;
-        if (priceYES > 99e16) priceYES = 99e16;
-        uint256 targetPriceNO = 1e18 - priceYES;
-        vNO = (vUSDC * 1e18) / targetPriceNO;
-        emit Rebalanced(false, vUSDC, vNO);
-    }
-
-    function _rebalanceYES() internal {
-        uint256 priceNO = (vUSDC * 1e18) / vNO;
-        if (priceNO > 99e16) priceNO = 99e16;
-        uint256 targetPriceYES = 1e18 - priceNO;
-        vYES = (vUSDC * 1e18) / targetPriceYES;
-        emit Rebalanced(true, vUSDC, vYES);
+    function _rebalance(bool _updateYES) internal {
+        if (_updateYES) { 
+            uint256 priceNO = (vUSDC * 1e18) / vNO;
+            if (priceNO > 99e16) priceNO = 99e16;
+            vYES = (vUSDC * 1e18) / (1e18 - priceNO);
+            emit Rebalanced(true, vUSDC, vYES);
+        } else { 
+            uint256 priceYES = (vUSDC * 1e18) / vYES;
+            if (priceYES > 99e16) priceYES = 99e16;
+            vNO = (vUSDC * 1e18) / (1e18 - priceYES);
+            emit Rebalanced(false, vUSDC, vNO);
+        }
     }
 
     function getCurrentPrice(bool _isYes) public view returns (uint256) {

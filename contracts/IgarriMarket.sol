@@ -150,6 +150,7 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
 
     function buyShares(address _buyer, bool _isYes, uint256 _shareAmount, uint256 _deadline, bytes calldata _userSignature, bytes calldata _serverSignature) external nonReentrant {
         if (block.timestamp > _deadline) revert SignatureExpired();
+        if (marketResolved) revert MarketAlreadyResolved();
         if (migrated) revert MarketMigrated();
 
         _verifySigs(_buyer, keccak256(abi.encode(BUY_SHARES_TYPEHASH, _buyer, _isYes, _shareAmount, _useNonce(_buyer), _deadline)), _userSignature, _serverSignature);
@@ -293,26 +294,35 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
         emit PositionLiquidated(_trader, _isYes, _keeper, keeperReward, pos.loanAmount, traderRefund);
     }
     
-    function resolveMarket(bool _winningOutcomeIsYes) external {
-        if (msg.sender != serverSigner) revert NotAuthorized(); 
-        if (marketResolved) revert MarketAlreadyResolved();
-        
-        marketResolved = true;
-        phase2Active = false; 
-        winningOutcomeIsYes = _winningOutcomeIsYes;
-        resolvedAt = block.timestamp; 
+   function resolveMarket(bool _winningOutcomeIsYes) external {
+    if (msg.sender != serverSigner) revert NotAuthorized(); 
+    if (marketResolved) revert MarketAlreadyResolved();
+    
+    marketResolved = true;
+    phase2Active = false; 
+    winningOutcomeIsYes = _winningOutcomeIsYes;
+    resolvedAt = block.timestamp; 
 
-        uint256 totalWinningShares18 = _winningOutcomeIsYes ? (yesToken.totalSupply() + phase2YesOI) : (noToken.totalSupply() + phase2NoOI);
-        uint256 availableUSDC6 = realUSDC.balanceOf(address(this));
-        uint256 liabilities6 = totalWinningShares18 / SCALE_FACTOR; 
-        
-        if (liabilities6 <= availableUSDC6 || liabilities6 == 0) {
-            settlementPrice18 = 1e18;
-        } else {
-            settlementPrice18 = (availableUSDC6 * 1e18) / liabilities6;
+    if (!migrated) {
+        uint256 igBalance = igUSDC.balanceOf(address(this));
+        if (igBalance > 0) {
+            igUSDC.approve(address(vault), igBalance);
+            vault.redeem(igBalance); 
         }
-        emit MarketResolved(_winningOutcomeIsYes, settlementPrice18);
     }
+
+    uint256 totalWinningShares18 = _winningOutcomeIsYes ? (yesToken.totalSupply() + phase2YesOI) : (noToken.totalSupply() + phase2NoOI);
+    
+    uint256 availableUSDC6 = realUSDC.balanceOf(address(this));
+    uint256 liabilities6 = totalWinningShares18 / SCALE_FACTOR; 
+    
+    if (liabilities6 <= availableUSDC6 || liabilities6 == 0) {
+        settlementPrice18 = 1e18;
+    } else {
+        settlementPrice18 = (availableUSDC6 * 1e18) / liabilities6;
+    }
+    emit MarketResolved(_winningOutcomeIsYes, settlementPrice18);
+}
 
     function claimWinningsFor(address _user, bool _isPhase1, UserTier _tier, uint256 _deadline, bytes calldata _serverSignature) external nonReentrant {
         if (!marketResolved) revert MarketNotResolved();
@@ -337,8 +347,6 @@ contract IgarriMarket is Singleton, StorageAccessible, ReentrancyGuard {
         }
         emit WinningsClaimed(_user, _isPhase1, payout6); 
     }
-
-    // --- HEAVILY CONDENSED INTERNAL HELPERS ---
     
     function _processPhase2Claim(address _user, bool _isSweep, UserTier _tier) internal returns (uint256 payout6) {
         LeveragedPosition storage pos = positions[_user][winningOutcomeIsYes];

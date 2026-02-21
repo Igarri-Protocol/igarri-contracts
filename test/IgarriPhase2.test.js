@@ -6,7 +6,7 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
   let owner, user1, user2, keeper;
   let serverWallet;
   let realUSDC, yieldToken, aavePool;
-  let igUSDC, vault, lendingVault, factory, market, insuranceFund;
+  let igUSDC, vault, lendingVault, factory, market, insuranceFund, mathLib; // <-- Added mathLib
   let chainId;
 
   const DECIMALS_USDC = 6n;
@@ -233,8 +233,21 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       .connect(owner)
       .addAllowedMarket(await lendingVault.getAddress());
 
-    const Market = await ethers.getContractFactory("IgarriMarket");
+    // =========================================================
+    // DEPLOY AND LINK EXTERNAL MATH LIBRARY
+    // =========================================================
+    const MathLib = await ethers.getContractFactory("IgarriMathLib");
+    mathLib = await MathLib.deploy();
+    await mathLib.waitForDeployment();
+
+    const Market = await ethers.getContractFactory("IgarriMarket", {
+      libraries: {
+        IgarriMathLib: await mathLib.getAddress(),
+      },
+    });
     const singleton = await Market.deploy();
+    await singleton.waitForDeployment();
+    // =========================================================
 
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
@@ -303,7 +316,6 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
         .connect(user2)
         .approve(await market.getAddress(), ethers.MaxUint256);
 
-      // --- FIXED: Added Signature Generation for buyShares ---
       const nonce = await market.nonces(user1.address);
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
 

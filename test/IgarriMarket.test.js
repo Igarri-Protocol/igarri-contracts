@@ -11,7 +11,8 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
     insuranceFund,
     factory,
     singleton,
-    marketProxy;
+    marketProxy,
+    mathLib;
   let chainId;
 
   // Set to 50,000 USDC (6 decimals). The contract will multiply by SCALE_FACTOR internally.
@@ -145,11 +146,22 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       params: [factoryAddress],
     });
 
-    // 5. Deploy Market Singleton and Proxy
-    const Market = await ethers.getContractFactory("IgarriMarket");
-    singleton = await Market.deploy();
+    // =========================================================
+    // 5. DEPLOY AND LINK EXTERNAL MATH LIBRARY
+    // =========================================================
+    const MathLib = await ethers.getContractFactory("IgarriMathLib");
+    mathLib = await MathLib.deploy();
+    await mathLib.waitForDeployment();
 
-    // UPDATED: Include all 7 arguments required by the new initialize function
+    const Market = await ethers.getContractFactory("IgarriMarket", {
+      libraries: {
+        IgarriMathLib: await mathLib.getAddress(),
+      },
+    });
+    singleton = await Market.deploy();
+    await singleton.waitForDeployment();
+    // =========================================================
+
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
       await vault.getAddress(),

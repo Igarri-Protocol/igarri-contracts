@@ -12,11 +12,17 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
     factory,
     singleton,
     marketProxy,
-    mathLib;
+    mockReality,
+    mathLib,
+    signatureLib,
+    yesToken,
+    noToken;
   let chainId;
 
   // Set to 50,000 USDC (6 decimals). The contract will multiply by SCALE_FACTOR internally.
   const THRESHOLD = 50_000n * 10n ** 6n;
+  // Freeze time set 30 days into the future so 'onlyBeforeEnd' doesn't revert trades
+  const TRADING_END_TIME = BigInt(Math.floor(Date.now() / 1000) + 86400 * 30);
 
   // --- EIP-712 HELPERS ---
   async function getDomain() {
@@ -66,13 +72,17 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       ethers.provider,
     );
 
-    // 1. Deploy Mocks
+    // 1. Deploy Mocks & External Infrastructure
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     realUSDC = await MockUSDC.deploy("Mock USDC", "USDC", 6);
     yieldToken = await MockUSDC.deploy("Yield aUSDC", "aUSDC", 6);
 
     const MockAavePool = await ethers.getContractFactory("MockAavePool");
     aavePool = await MockAavePool.deploy(await yieldToken.getAddress());
+
+    const MockRealityETH = await ethers.getContractFactory("MockRealityETH");
+    mockReality = await MockRealityETH.deploy();
+    await mockReality.waitForDeployment();
 
     // 2. Deploy Core Infrastructure
     const Vault = await ethers.getContractFactory("IgarriVault");
@@ -92,7 +102,6 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       await factory.getAddress(),
     );
 
-    // 3. Deploy Missing Dependencies for New Architecture
     const LendingVault = await ethers.getContractFactory("IgarriLendingVault");
     lendingVault = await LendingVault.deploy(
       await igUSDC.getAddress(),
@@ -113,7 +122,7 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       await yieldToken.getAddress(),
     );
 
-    // 4. Link Dependencies & Permissions
+    // 3. Link Dependencies & Permissions
     await vault.setIgarriUSDC(await igUSDC.getAddress());
     await vault.setIgarriMarketFactory(await factory.getAddress());
     await vault.setLendingVault(await lendingVault.getAddress());
@@ -147,35 +156,73 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
     });
 
     // =========================================================
-    // 5. DEPLOY AND LINK EXTERNAL MATH LIBRARY
+    // 4. DEPLOY AND LINK EXTERNAL LIBRARIES
     // =========================================================
     const MathLib = await ethers.getContractFactory("IgarriMathLib");
     mathLib = await MathLib.deploy();
     await mathLib.waitForDeployment();
 
+    const SignatureLib = await ethers.getContractFactory("IgarriSignatureLib");
+    signatureLib = await SignatureLib.deploy();
+    await signatureLib.waitForDeployment();
+
     const Market = await ethers.getContractFactory("IgarriMarket", {
       libraries: {
         IgarriMathLib: await mathLib.getAddress(),
+        IgarriSignatureLib: await signatureLib.getAddress(),
       },
     });
     singleton = await Market.deploy();
     await singleton.waitForDeployment();
     // =========================================================
 
+    // =========================================================
+    // 5. PREDICT ADDRESS & DEPLOY OUTCOME TOKENS
+    // =========================================================
+    const salt = ethers.id("market-v1");
+    const predictedMarketAddress = await factory.calculateProxyAddress(
+      await singleton.getAddress(),
+      salt,
+    );
+
+    const OutcomeToken = await ethers.getContractFactory("IgarriOutcomeToken");
+    yesToken = await OutcomeToken.deploy(
+      "BTC-MOON YES",
+      "YES",
+      predictedMarketAddress,
+    );
+    await yesToken.waitForDeployment();
+
+    noToken = await OutcomeToken.deploy(
+      "BTC-MOON NO",
+      "NO",
+      predictedMarketAddress,
+    );
+    await noToken.waitForDeployment();
+
+    // =========================================================
+    // 6. INITIALIZE MARKET PROXY
+    // =========================================================
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
       await vault.getAddress(),
-      "BTC-MOON",
       THRESHOLD,
       await lendingVault.getAddress(),
       serverWallet.address,
       await insuranceFund.getAddress(),
+      TRADING_END_TIME,
+      await mockReality.getAddress(),
+      ethers.ZeroAddress, // mock arbitrator
+      86400, // timeout
+      "Will BTC Moon?␟crypto␟en",
+      await yesToken.getAddress(),
+      await noToken.getAddress(),
     ]);
 
     const tx = await factory.deployMarket(
       await singleton.getAddress(),
       initData,
-      ethers.id("market-v1"),
+      salt, // Use the same salt to match the predicted address
     );
     const receipt = await tx.wait();
 
@@ -190,6 +237,9 @@ describe("Igarri Protocol Phase 1 (Aave Integration)", function () {
       .find((p) => p && p.name === "ProxyDeployed");
 
     marketProxy = await ethers.getContractAt("IgarriMarket", event.args.proxy);
+
+    // Sanity check that proxy address matches our prediction
+    expect(await marketProxy.getAddress()).to.equal(predictedMarketAddress);
   });
 
   it("Should deposit USDC, mint igUSDC, and supply to Aave", async function () {

@@ -124,8 +124,6 @@ contract IgarriVault is ReentrancyGuard {
     function moveFundsToLendingPool(uint256 _igUsdcAmount) external nonReentrant onlyLendingVault {
         uint256 realAmount = _igUsdcAmount / SCALE_FACTOR;
 
-        // 1. BURN the igUSDC held by the Lending Vault
-        // This ensures igUSDC supply shrinks when backing assets leave
         igUSDC.burn(msg.sender, _igUsdcAmount);
 
         aavePool.withdraw(address(realUSDC), realAmount, address(this));
@@ -149,8 +147,6 @@ contract IgarriVault is ReentrancyGuard {
         aavePool.supply(address(realUSDC), _realUsdcAmount, address(this), 0);
         totalRealUSDCInVault += _realUsdcAmount;
 
-        // 2. MINT new igUSDC to the Lending Vault
-        // This creates the tokens for Principal + Yield
         uint256 igToMint = _realUsdcAmount * SCALE_FACTOR;
         igUSDC.mint(msg.sender, igToMint);
 

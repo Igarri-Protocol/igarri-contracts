@@ -10,7 +10,6 @@ import "./interfaces/IIgarriInsuranceFund.sol";
 /**
  * @title IgarriMarketFactory
  * @notice Factory contract for deploying Igarri Market instances
- * @dev Enhanced version with better error handling, events, and public interface
  */
 contract IgarriMarketFactory {
     mapping (address => bool) public deployer;
@@ -20,7 +19,6 @@ contract IgarriMarketFactory {
     address public igarriLendingVault;
     address public igarriInsuranceFund;
 
-    // Events for transparency and indexing
     event ProxyDeployed(
         address indexed proxy,
         address indexed singleton,
@@ -28,7 +26,6 @@ contract IgarriMarketFactory {
         address deployer
     );
 
-    // Custom errors for gas efficiency and better UX
     error SingletonNotDeployed();
     error ProxyDeploymentFailed();
     error InitializationFailed();

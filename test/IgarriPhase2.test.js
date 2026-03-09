@@ -6,13 +6,17 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
   let owner, user1, user2, keeper;
   let serverWallet;
   let realUSDC, yieldToken, aavePool;
-  let igUSDC, vault, lendingVault, factory, market, insuranceFund, mathLib; // <-- Added mathLib
+  let igUSDC, vault, lendingVault, factory, market, insuranceFund, mathLib;
+  let mockReality, signatureLib, yesToken, noToken; // <-- New additions
   let chainId;
 
   const DECIMALS_USDC = 6n;
   const SCALE_FACTOR = 10n ** 12n;
   const MIGRATION_THRESHOLD = 50_000n * 10n ** DECIMALS_USDC;
   const LP_LIQUIDITY = 1_000_000n * 10n ** DECIMALS_USDC;
+
+  // Freeze time set 30 days into the future so 'onlyBeforeEnd' doesn't revert trades
+  const TRADING_END_TIME = BigInt(Math.floor(Date.now() / 1000) + 86400 * 30);
 
   // --- EIP-712 HELPERS ---
 
@@ -156,12 +160,19 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       ethers.provider,
     );
 
+    // 1. Deploy Mocks & Reality.eth
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     realUSDC = await MockUSDC.deploy("Mock USDC", "USDC", 6);
     yieldToken = await MockUSDC.deploy("Yield aUSDC", "aUSDC", 6);
+
     const MockAavePool = await ethers.getContractFactory("MockAavePool");
     aavePool = await MockAavePool.deploy(await yieldToken.getAddress());
 
+    const MockRealityETH = await ethers.getContractFactory("MockRealityETH");
+    mockReality = await MockRealityETH.deploy();
+    await mockReality.waitForDeployment();
+
+    // 2. Deploy Infrastructure
     const Vault = await ethers.getContractFactory("IgarriVault");
     vault = await Vault.deploy(
       await realUSDC.getAddress(),
@@ -234,35 +245,73 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       .addAllowedMarket(await lendingVault.getAddress());
 
     // =========================================================
-    // DEPLOY AND LINK EXTERNAL MATH LIBRARY
+    // 3. DEPLOY AND LINK EXTERNAL LIBRARIES
     // =========================================================
     const MathLib = await ethers.getContractFactory("IgarriMathLib");
     mathLib = await MathLib.deploy();
     await mathLib.waitForDeployment();
 
+    const SignatureLib = await ethers.getContractFactory("IgarriSignatureLib");
+    signatureLib = await SignatureLib.deploy();
+    await signatureLib.waitForDeployment();
+
     const Market = await ethers.getContractFactory("IgarriMarket", {
       libraries: {
         IgarriMathLib: await mathLib.getAddress(),
+        IgarriSignatureLib: await signatureLib.getAddress(),
       },
     });
     const singleton = await Market.deploy();
     await singleton.waitForDeployment();
     // =========================================================
 
+    // =========================================================
+    // 4. PREDICT ADDRESS & DEPLOY OUTCOME TOKENS
+    // =========================================================
+    const salt = ethers.id("market-test-v1");
+    const predictedMarketAddress = await factory.calculateProxyAddress(
+      await singleton.getAddress(),
+      salt,
+    );
+
+    const OutcomeToken = await ethers.getContractFactory("IgarriOutcomeToken");
+    yesToken = await OutcomeToken.deploy(
+      "TRUMP-2024 YES",
+      "YES",
+      predictedMarketAddress,
+    );
+    await yesToken.waitForDeployment();
+
+    noToken = await OutcomeToken.deploy(
+      "TRUMP-2024 NO",
+      "NO",
+      predictedMarketAddress,
+    );
+    await noToken.waitForDeployment();
+
+    // =========================================================
+    // 5. INITIALIZE MARKET PROXY
+    // =========================================================
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
       await vault.getAddress(),
-      "TRUMP-2024",
       MIGRATION_THRESHOLD,
       await lendingVault.getAddress(),
       serverWallet.address,
       await insuranceFund.getAddress(),
+      TRADING_END_TIME,
+      await mockReality.getAddress(),
+      ethers.ZeroAddress, // mock arbitrator
+      86400, // timeout
+      "Did Trump win?␟politics␟en",
+      await yesToken.getAddress(),
+      await noToken.getAddress(),
     ]);
 
     const tx = await factory.deployMarket(
       await singleton.getAddress(),
       initData,
-      ethers.id("market-test-v1"),
+      salt, // Same salt used for prediction
     );
     const receipt = await tx.wait();
     const event = receipt.logs.find((log) => {
@@ -277,6 +326,10 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
       factory.interface.parseLog(event).args.proxy,
     );
 
+    // Sanity check
+    expect(await market.getAddress()).to.equal(predictedMarketAddress);
+
+    // Fund Accounts
     await realUSDC.mint(user1.address, 1_000_000n * 10n ** 6n);
     await realUSDC.mint(user2.address, 1_000_000n * 10n ** 6n);
     await realUSDC.mint(owner.address, LP_LIQUIDITY * 2n);
@@ -477,7 +530,8 @@ describe("Igarri Protocol: Full Lifecycle (With EIP-712 Signatures)", function (
           .bulkLiquidate(traders, sides, deadline, serverSig),
       ).to.emit(market, "PositionLiquidated");
 
-      const posNo = await market.positions(user1.address, false);
+      // Verify position using the new public getter
+      const posNo = await market.getPosition(user1.address, false);
       expect(posNo.active).to.be.false;
     });
   });

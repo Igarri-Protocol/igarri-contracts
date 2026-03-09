@@ -7,13 +7,16 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
   let serverWallet;
   let realUSDC, yieldToken, aavePool;
   let igUSDC, vault, lendingVault, insuranceFund, factory, market;
-  let mathLib; // <-- Added library tracking variable
+  let mockReality, mathLib, signatureLib; // <-- Added dependencies
   let chainId;
 
   const DECIMALS_USDC = 6n;
   const SCALE_FACTOR = 10n ** 12n;
   const THRESHOLD = 50_000n * 10n ** DECIMALS_USDC;
   const LP_LIQUIDITY = 500_000n * 10n ** DECIMALS_USDC;
+
+  // Freeze time set far into the future so 'onlyBeforeEnd' doesn't revert trades
+  const TRADING_END_TIME = BigInt(Math.floor(Date.now() / 1000) + 86400 * 30);
 
   const UserTier = {
     Standard: 0,
@@ -94,7 +97,6 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
     return { userSig, serverSig };
   }
 
-  // NEW HELPER: Sign Claim Winnings (Keeper Pattern)
   async function signClaimTier(
     server,
     user,
@@ -125,12 +127,16 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
       ethers.provider,
     );
 
-    // 1. Deploy Mocks
+    // 1. Deploy Mocks & Reality.eth
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     realUSDC = await MockUSDC.deploy("Mock USDC", "USDC", 6);
     yieldToken = await MockUSDC.deploy("Yield aUSDC", "aUSDC", 6);
     const MockAavePool = await ethers.getContractFactory("MockAavePool");
     aavePool = await MockAavePool.deploy(await yieldToken.getAddress());
+
+    const MockRealityETH = await ethers.getContractFactory("MockRealityETH");
+    mockReality = await MockRealityETH.deploy();
+    await mockReality.waitForDeployment();
 
     // 2. Deploy Infrastructure
     const Vault = await ethers.getContractFactory("IgarriVault");
@@ -201,35 +207,71 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
     });
 
     // =========================================================
-    // 4. DEPLOY AND LINK EXTERNAL MATH LIBRARY
+    // 4. DEPLOY LIBRARIES & SINGLETON
     // =========================================================
     const MathLib = await ethers.getContractFactory("IgarriMathLib");
     mathLib = await MathLib.deploy();
     await mathLib.waitForDeployment();
 
+    const SignatureLib = await ethers.getContractFactory("IgarriSignatureLib");
+    signatureLib = await SignatureLib.deploy();
+    await signatureLib.waitForDeployment();
+
     const Market = await ethers.getContractFactory("IgarriMarket", {
       libraries: {
         IgarriMathLib: await mathLib.getAddress(),
+        IgarriSignatureLib: await signatureLib.getAddress(),
       },
     });
     const singleton = await Market.deploy();
     await singleton.waitForDeployment();
-    // =========================================================
 
+    // =========================================================
+    // 5. PREDICT ADDRESS & DEPLOY OUTCOME TOKENS
+    // =========================================================
+    const salt = ethers.id("market-phase3-test");
+    const predictedMarketAddress = await factory.calculateProxyAddress(
+      await singleton.getAddress(),
+      salt,
+    );
+
+    const OutcomeToken = await ethers.getContractFactory("IgarriOutcomeToken");
+    const yesToken = await OutcomeToken.deploy(
+      "ETH-10K YES",
+      "YES",
+      predictedMarketAddress,
+    );
+    const noToken = await OutcomeToken.deploy(
+      "ETH-10K NO",
+      "NO",
+      predictedMarketAddress,
+    );
+    await yesToken.waitForDeployment();
+    await noToken.waitForDeployment();
+
+    // =========================================================
+    // 6. INITIALIZE MARKET PROXY
+    // =========================================================
     const initData = singleton.interface.encodeFunctionData("initialize", [
       await igUSDC.getAddress(),
       await vault.getAddress(),
-      "ETH-10K",
       THRESHOLD,
       await lendingVault.getAddress(),
       serverWallet.address,
       await insuranceFund.getAddress(),
+      TRADING_END_TIME,
+      await mockReality.getAddress(),
+      ethers.ZeroAddress, // mock arbitrator
+      86400, // timeout
+      "Did ETH hit 10k?␟crypto␟en",
+      await yesToken.getAddress(),
+      await noToken.getAddress(),
     ]);
 
     const tx = await factory.deployMarket(
       await singleton.getAddress(),
       initData,
-      ethers.id("market-phase3-test"),
+      salt,
     );
     const receipt = await tx.wait();
     const event = receipt.logs.find((log) => {
@@ -244,7 +286,7 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
       factory.interface.parseLog(event).args.proxy,
     );
 
-    // 5. Fund Users & LP
+    // 7. Fund Users & LP
     const users = [phase1Winner, phase2Winner, phase2Loser, whale];
     for (let u of users) {
       await realUSDC.mint(u.address, 100_000n * 10n ** 6n);
@@ -388,8 +430,14 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
 
   describe("Execution: Settlement & Claims", function () {
     it("Should resolve the market to YES and set Price to $1.00", async function () {
-      // Must be called by serverSigner now
-      await expect(market.connect(serverWallet).resolveMarket(true))
+      const questionID = await market.questionID();
+
+      // Oracle resolves the question to YES (1)
+      const yesResult = ethers.zeroPadValue(ethers.toBeHex(1), 32);
+      await mockReality.setMockResult(questionID, yesResult);
+
+      // Anyone can trigger the pull flow to resolve
+      await expect(market.resolveMarket())
         .to.emit(market, "MarketResolved")
         .withArgs(true, ethers.parseUnits("1.0", 18));
 
@@ -409,7 +457,6 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
 
       const balBefore = await igUSDC.balanceOf(phase1Winner.address);
 
-      // Generate server signature for claiming
       const nonce = await market.nonces(phase1Winner.address);
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
       const claimSig = await signClaimTier(
@@ -441,7 +488,7 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
     });
 
     it("Phase 2 Winner should claim (Profit - Loan + Multiplied Yield)", async function () {
-      const pos = await market.positions(phase2Winner.address, true);
+      const pos = await market.getPosition(phase2Winner.address, true);
       const balBefore = await igUSDC.balanceOf(phase2Winner.address);
 
       const nonce = await market.nonces(phase2Winner.address);
@@ -470,7 +517,7 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
       const balAfter = await igUSDC.balanceOf(phase2Winner.address);
       const userReceived = balAfter - balBefore;
 
-      expect(userReceived).to.be.gt(pos.collateral * SCALE_FACTOR);
+      expect(userReceived).to.be.gt(BigInt(pos.collateral) * SCALE_FACTOR);
     });
 
     it("Phase 2 Loser should NOT be able to claim winnings", async function () {
@@ -504,23 +551,56 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
 
     before(async function () {
       const Market = await ethers.getContractFactory("IgarriMarket", {
-        libraries: { IgarriMathLib: await mathLib.getAddress() },
+        libraries: {
+          IgarriMathLib: await mathLib.getAddress(),
+          IgarriSignatureLib: await signatureLib.getAddress(),
+        },
       });
       const singleton = await Market.deploy();
+
+      // Implement counterfactual instantiation for secondMarket
+      const salt = ethers.id("market-insolvent-test");
+      const predictedAddress = await factory.calculateProxyAddress(
+        await singleton.getAddress(),
+        salt,
+      );
+
+      const OutcomeToken = await ethers.getContractFactory(
+        "IgarriOutcomeToken",
+      );
+      const yesToken2 = await OutcomeToken.deploy(
+        "DUMMY YES",
+        "YES",
+        predictedAddress,
+      );
+      const noToken2 = await OutcomeToken.deploy(
+        "DUMMY NO",
+        "NO",
+        predictedAddress,
+      );
+      await yesToken2.waitForDeployment();
+      await noToken2.waitForDeployment();
+
       const initData = singleton.interface.encodeFunctionData("initialize", [
         await igUSDC.getAddress(),
         await vault.getAddress(),
-        "DUMMY-MARKET",
         THRESHOLD,
         await lendingVault.getAddress(),
         serverWallet.address,
         await insuranceFund.getAddress(),
+        TRADING_END_TIME,
+        await mockReality.getAddress(),
+        ethers.ZeroAddress,
+        86400,
+        "Dummy?␟misc␟en",
+        await yesToken2.getAddress(),
+        await noToken2.getAddress(),
       ]);
 
       const tx = await factory.deployMarket(
         await singleton.getAddress(),
         initData,
-        ethers.id("market-insolvent-test"),
+        salt,
       );
       const receipt = await tx.wait();
       const event = receipt.logs.find((log) => {
@@ -598,7 +678,12 @@ describe("Igarri Protocol: Phase 3 (Resolution & Settlement)", function () {
       const totalShares18 = await yesToken.totalSupply();
       const liabilities6 = totalShares18 / SCALE_FACTOR;
 
-      const tx = await secondMarket.connect(serverWallet).resolveMarket(true);
+      // Oracle resolves the question to YES
+      const questionID = await secondMarket.questionID();
+      const yesResult = ethers.zeroPadValue(ethers.toBeHex(1), 32);
+      await mockReality.setMockResult(questionID, yesResult);
+
+      const tx = await secondMarket.resolveMarket();
       const receipt = await tx.wait();
 
       const resolvedEvent = receipt.logs.find(

@@ -23,8 +23,9 @@ module.exports = {
   },
   networks: {
     baseSepolia: {
-      url: `https://sepolia.base.org`,
+      url: `https://base-sepolia-rpc.publicnode.com`,
       accounts: [PRIVATE_KEY],
+      chainId: 84532,
     },
   },
   etherscan: {
